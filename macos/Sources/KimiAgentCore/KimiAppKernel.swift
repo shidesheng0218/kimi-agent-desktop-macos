@@ -413,7 +413,7 @@ public actor KimiAppKernel {
             let session = state.sessions.first(where: { $0.id == activeID }) else { break }
       let runtimeID = session.runtimeID ?? session.id.uuidString
       do {
-        try await sessionClient.summarize(sessionID: runtimeID, directory: directoryForSession(runtimeID))
+        try await sessionClient.summarize(sessionID: runtimeID, modelID: state.selectedModel, directory: directoryForSession(runtimeID))
         state.activities.append(KimiActivity(title: "压缩上下文", detail: "已请求引擎压缩会话上下文。", state: .running))
       } catch {
         state.lastError = "压缩上下文失败：\(error.localizedDescription)"

@@ -122,7 +122,7 @@ public protocol KimiRuntimeSessionClient: Sendable {
   func revert(sessionID: String, messageID: String, directory: String?) async throws
   func unrevert(sessionID: String, directory: String?) async throws
   func runCommand(sessionID: String, command: String, arguments: String, directory: String?) async throws
-  func summarize(sessionID: String, directory: String?) async throws
+  func summarize(sessionID: String, modelID: String, directory: String?) async throws
   func fetchMcpStatus(directory: String?) async throws -> [KimiMcpServerStatus]
   func fetchSkills(directory: String?) async throws -> [KimiSkillSummary]
   /// Engine-side busy/idle map (`GET /session/status`), used to reconcile UI
@@ -143,7 +143,7 @@ public extension KimiRuntimeSessionClient {
   func revert(sessionID: String, messageID: String, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   func unrevert(sessionID: String, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   func runCommand(sessionID: String, command: String, arguments: String, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
-  func summarize(sessionID: String, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
+  func summarize(sessionID: String, modelID: String, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   func fetchMcpStatus(directory: String?) async throws -> [KimiMcpServerStatus] { [] }
   func fetchSkills(directory: String?) async throws -> [KimiSkillSummary] { [] }
   func fetchSessionStatuses(directory: String?) async throws -> [String: String] { [:] }
@@ -290,12 +290,14 @@ public final class URLSessionRuntimeClient: KimiRuntimeSessionClient, @unchecked
     )
   }
 
-  public func summarize(sessionID: String, directory: String?) async throws {
+  public func summarize(sessionID: String, modelID: String, directory: String?) async throws {
+    // The engine rejects the request without providerID/modelID ("Missing
+    // key at [\"providerID\"]") — auto:true alone is not enough.
     _ = try await requestData(
       path: "/session/\(sessionID)/summarize",
       method: "POST",
       query: directoryQuery(directory),
-      body: ["auto": true]
+      body: ["providerID": KimiRuntimeIdentityStore.providerID, "modelID": modelID, "auto": true]
     )
   }
 

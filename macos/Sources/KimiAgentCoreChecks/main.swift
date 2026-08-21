@@ -5965,8 +5965,9 @@ _ = try! awaitValue { try await mockClient.answerQuestion(requestID: "q-1", answ
 expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /question/q-1/reply") && $0.contains("\"answers\"") }), "问题应答必须使用 /question/{id}/reply 并携带 answers")
 _ = try! awaitValue { try await mockClient.runCommand(sessionID: "session-1", command: "review", arguments: "src/", directory: nil); return () }
 expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/command") && $0.contains("\"command\":\"review\"") }), "Slash 命令必须走 /session/{id}/command 端点")
-_ = try! awaitValue { try await mockClient.summarize(sessionID: "session-1", directory: nil); return () }
+_ = try! awaitValue { try await mockClient.summarize(sessionID: "session-1", modelID: "kimi-k2.7-code", directory: nil); return () }
 expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/summarize") }), "压缩上下文必须走 summarize 端点")
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("/summarize") && $0.contains("\"providerID\":\"moonshotai-cn\"") && $0.contains("\"modelID\":\"kimi-k2.7-code\"") }), "summarize 请求体必须带 providerID/modelID（引擎无此字段会 400 Missing key）")
 _ = try! awaitValue { try await mockClient.fetchTodos(sessionID: "session-1", directory: nil); return () }
 expect(engineRequestTrace.snapshot.contains(where: { $0.contains("GET /session/session-1/todo") }), "待办必须能从 /session/{id}/todo 拉取")
 _ = try! awaitValue { try await mockClient.fetchCommands(directory: nil); return () }
