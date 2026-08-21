@@ -29,9 +29,13 @@ struct KimiCodeAgentApp: App {
   var body: some Scene {
     WindowGroup("Kimi Code Agent") {
       KimiRootView(model: model)
-        .frame(minWidth: 1_120, minHeight: 720)
+        // KimiRootView's three panes have their own minimums (260 sidebar +
+        // 540 workspace + 360 terminal + 2 dividers = 1162): the window's own
+        // minimum must be at least that or shrinking toward it clips content.
+        .frame(minWidth: 1_180, minHeight: 760)
         .task { await model.start() }
     }
+    .defaultSize(width: 1_360, height: 860)
     .commands {
       CommandGroup(after: .newItem) {
         Button("新建会话") { model.createSession() }
@@ -225,6 +229,59 @@ final class KimiAppViewModel: ObservableObject {
     }
   }
 
+  /// Re-bind the active session to a different project directory chosen by
+  /// the user. Mirrors createSession but skips spawning a new session —
+  /// the engine keeps the same session; only the working directory changes.
+  @MainActor
+  func changeProjectDirectory() {
+    guard let newDir = pickProjectDirectory() else { return }
+    Task {
+      guard let activeID = state.activeSessionID,
+            let session = state.sessions.first(where: { $0.id == activeID }),
+            let runtimeID = session.runtimeID else { return }
+      // Re-create the session with the new directory (engine binds directory
+      // at session creation time, so the cleanest way is a new session in the
+      // new directory while keeping the UI in the same view).
+      try? await kernel.send(.createSession(directory: newDir.path))
+      await refresh()
+      _ = runtimeID // silence warning; the old session stays in history
+    }
+  }
+
+  func changeThinkingEffort(_ effort: String) {
+    Task {
+      try? await kernel.send(.changeThinkingEffort(effort))
+      await refresh()
+    }
+  }
+
+  // MARK: - API key management
+
+  /// Returns true when a non-empty API key is saved in the credential vault.
+  @MainActor
+  func loadAPIKeyStatus() -> Bool {
+    let vault = MacKeychainCredentialVault()
+    return (try? vault.read(key: "kimi.runtime.identity.apiKey"))?
+      .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+  }
+
+  /// Saves the key to the Keychain and restarts the engine so it takes effect.
+  func saveAPIKey(_ apiKey: String) {
+    let vault = MacKeychainCredentialVault()
+    let store = KimiRuntimeIdentityStore(vault: vault)
+    do {
+      try store.connectAPI(apiKey: apiKey)
+      Task {
+        try? await kernel.send(.restartRuntime)
+        await refresh()
+      }
+    } catch {
+      Task { @MainActor in
+        self.state.lastError = "API 密钥保存失败：\(error.localizedDescription)"
+      }
+    }
+  }
+
   func restartRuntime() {
     Task {
       try? await kernel.send(.restartRuntime)
@@ -412,10 +469,11 @@ enum KimiDesign {
 
 struct KimiRootView: View {
   @ObservedObject var model: KimiAppViewModel
+  @State private var showAPIKeySetup = false
 
   var body: some View {
     HStack(spacing: 0) {
-      KimiSidebarView(model: model)
+      KimiSidebarView(model: model, onConfigureAPIKey: { showAPIKeySetup = true })
         .frame(width: 260)
       Divider()
       if model.state.activeSessionID == nil {
@@ -431,6 +489,15 @@ struct KimiRootView: View {
     }
     .background(KimiDesign.background)
     .preferredColorScheme(.light)
+    .sheet(isPresented: $showAPIKeySetup) {
+      KimiAPIKeySetupView(model: model, isPresented: $showAPIKeySetup)
+    }
+    .onAppear {
+      // Auto-show setup if no key is configured
+      if !model.loadAPIKeyStatus() {
+        showAPIKeySetup = true
+      }
+    }
   }
 }
 
@@ -442,13 +509,19 @@ struct KimiTerminalPane: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
-      HStack {
-        Label("终端", systemImage: "terminal")
-        Spacer()
+      VStack(alignment: .leading, spacing: 2) {
+        HStack {
+          Label("终端", systemImage: "terminal")
+          Spacer()
+          Circle().fill(.green).frame(width: 7, height: 7)
+        }
+        // The pane is only 360pt wide; a status caption next to the title
+        // was overflowing the window edge instead of wrapping or truncating.
         Text("本机交互终端 · 不经权限门")
           .font(.caption2)
           .foregroundStyle(.white.opacity(0.45))
-        Circle().fill(.green).frame(width: 7, height: 7)
+          .lineLimit(1)
+          .truncationMode(.tail)
       }
       .padding(16)
       Divider()

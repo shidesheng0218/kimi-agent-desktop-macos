@@ -53,9 +53,16 @@ struct KimiComposerView: View {
       }
       HStack(spacing: 8) {
         if let activeProject {
-          chip(icon: "folder", text: activeProject)
+          // Clickable project chip — lets the user re-bind the active session
+          // to a different directory without creating a brand-new session.
+          Button(action: model.changeProjectDirectory) {
+            chipContent(icon: "folder", text: activeProject)
+          }
+          .buttonStyle(.plain)
+          .help("点击更换项目文件夹")
         }
         modelMenu
+        thinkingEffortMenu
         Spacer()
         HStack(spacing: 4) {
           Image(systemName: "hand.raised")
@@ -65,11 +72,14 @@ struct KimiComposerView: View {
         }
         .foregroundStyle(KimiDesign.muted)
       }
-      HStack(alignment: .bottom, spacing: 10) {
+      // Input box with send button embedded inside, right side
+      ZStack(alignment: .trailing) {
         TextField("描述你想完成的任务…", text: $model.composerText, axis: .vertical)
           .textFieldStyle(.plain)
           .lineLimit(1...6)
-          .padding(12)
+          .padding(.leading, 14)
+          .padding(.trailing, 46)   // room for the inline button
+          .padding(.vertical, 12)
           .background(KimiDesign.surface)
           .clipShape(RoundedRectangle(cornerRadius: KimiDesign.radius))
           .overlay(
@@ -77,39 +87,41 @@ struct KimiComposerView: View {
               .stroke(KimiDesign.border, lineWidth: 1)
           )
           .onSubmit { model.sendPrompt() }
+
+        // Inline send / stop button
         if model.isActiveSessionBusy {
           Button(action: model.abortActive) {
             Image(systemName: "stop.fill")
-              .font(.headline)
-              .frame(width: 38, height: 38)
+              .font(.caption)
+              .foregroundStyle(.white)
+              .frame(width: 26, height: 26)
+              .background(Color.red)
+              .clipShape(RoundedRectangle(cornerRadius: 7))
           }
-          .buttonStyle(.borderedProminent)
-          .tint(.red)
+          .buttonStyle(.plain)
+          .padding(.trailing, 10)
           .help("停止当前执行")
-          Button(action: model.sendFollowUp) {
-            Image(systemName: "clock.arrow.circlepath")
-              .font(.headline)
-              .frame(width: 38, height: 38)
+        } else {
+          let isEmpty = model.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+          Button(action: model.sendPrompt) {
+            Image(systemName: "arrow.up")
+              .font(.caption)
+              .foregroundStyle(.white)
+              .frame(width: 26, height: 26)
+              .background(isEmpty ? KimiDesign.border : KimiDesign.primary)
+              .clipShape(RoundedRectangle(cornerRadius: 7))
           }
-          .buttonStyle(.bordered)
-          .disabled(model.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-          .help("排队：本轮结束后自动发送")
+          .buttonStyle(.plain)
+          .disabled(isEmpty)
+          .padding(.trailing, 10)
+          .help("发送")
         }
-        Button(action: model.sendPrompt) {
-          Image(systemName: model.isActiveSessionBusy ? "text.insert" : "arrow.up")
-            .font(.headline)
-            .frame(width: 38, height: 38)
-        }
-        .buttonStyle(.borderedProminent)
-        .tint(KimiDesign.primary)
-        .disabled(model.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        .help(model.isActiveSessionBusy ? "插入当前执行" : "发送")
       }
     }
   }
 
   private var modelMenu: some View {
-    Menu {
+    HoverableMenu(icon: "cpu", text: model.state.selectedModel) {
       ForEach(model.state.modelCatalog, id: \.self) { item in
         Button {
           model.changeModel(item)
@@ -122,11 +134,40 @@ struct KimiComposerView: View {
           }
         }
       }
-    } label: {
-      chipContent(icon: "cpu", text: model.state.selectedModel)
     }
-    .menuStyle(.borderlessButton)
-    .menuIndicator(.hidden)
+  }
+
+  private var thinkingEffortMenu: some View {
+    HoverableMenu(icon: "brain", text: model.state.thinkingEffort) {
+      ForEach(["Low", "Medium", "High"], id: \.self) { effort in
+        Button {
+          model.changeThinkingEffort(effort)
+        } label: {
+          HStack {
+            VStack(alignment: .leading, spacing: 2) {
+              Text(effort)
+                .font(.subheadline.weight(.medium))
+              Text(effortDescription(effort))
+                .font(.caption2)
+                .foregroundStyle(KimiDesign.muted)
+            }
+            Spacer()
+            if effort == model.state.thinkingEffort {
+              Image(systemName: "checkmark")
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private func effortDescription(_ effort: String) -> String {
+    switch effort {
+    case "Low": return "快速响应，适合简单任务"
+    case "Medium": return "平衡速度与质量"
+    case "High": return "深度思考，适合复杂问题"
+    default: return ""
+    }
   }
 
   private func chip(icon: String, text: String) -> some View {
@@ -134,6 +175,17 @@ struct KimiComposerView: View {
   }
 
   private func chipContent(icon: String, text: String) -> some View {
+    HoverableChip(icon: icon, text: text)
+  }
+}
+
+/// Hoverable chip with visual feedback
+private struct HoverableChip: View {
+  let icon: String
+  let text: String
+  @State private var isHovered = false
+
+  var body: some View {
     HStack(spacing: 5) {
       Image(systemName: icon).font(.caption2)
       Text(text)
@@ -143,7 +195,43 @@ struct KimiComposerView: View {
     .foregroundStyle(KimiDesign.muted)
     .padding(.horizontal, 10)
     .padding(.vertical, 5)
-    .background(KimiDesign.surfaceSecondary)
+    .background(isHovered ? Color.gray.opacity(0.25) : KimiDesign.surfaceSecondary)
     .clipShape(Capsule())
+    .animation(.easeInOut(duration: 0.15), value: isHovered)
+    .onHover { hovering in
+      isHovered = hovering
+    }
+  }
+}
+
+/// Hoverable menu with chip appearance
+private struct HoverableMenu<Content: View>: View {
+  let icon: String
+  let text: String
+  @ViewBuilder let content: Content
+  @State private var isHovered = false
+
+  var body: some View {
+    Menu {
+      content
+    } label: {
+      HStack(spacing: 5) {
+        Image(systemName: icon).font(.caption2)
+        Text(text)
+          .font(.caption.weight(.medium))
+          .lineLimit(1)
+      }
+      .foregroundStyle(KimiDesign.muted)
+      .padding(.horizontal, 10)
+      .padding(.vertical, 5)
+      .background(isHovered ? Color.gray.opacity(0.25) : KimiDesign.surfaceSecondary)
+      .clipShape(Capsule())
+      .animation(.easeInOut(duration: 0.15), value: isHovered)
+      .onHover { hovering in
+        isHovered = hovering
+      }
+    }
+    .menuStyle(.borderlessButton)
+    .menuIndicator(.hidden)
   }
 }

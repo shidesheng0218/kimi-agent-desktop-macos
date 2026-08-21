@@ -26,6 +26,7 @@ public enum KimiAppCommand: Sendable, Equatable {
   case openBrowser(UUID)
   case openFile(String)
   case changeModel(String)
+  case changeThinkingEffort(String)
   case restartRuntime
 
   public enum Kind: String, Codable, Sendable {
@@ -52,6 +53,7 @@ public enum KimiAppCommand: Sendable, Equatable {
     case openBrowser
     case openFile
     case changeModel
+    case changeThinkingEffort
     case restartRuntime
   }
 
@@ -80,6 +82,7 @@ public enum KimiAppCommand: Sendable, Equatable {
     case .openBrowser: .openBrowser
     case .openFile: .openFile
     case .changeModel: .changeModel
+    case .changeThinkingEffort: .changeThinkingEffort
     case .restartRuntime: .restartRuntime
     }
   }
@@ -401,6 +404,7 @@ public struct KimiUIState: Codable, Equatable, Sendable {
   public var pendingPermissions: [KimiPermissionRequest]
   public var lastError: String?
   public var selectedModel: String
+  public var thinkingEffort: String
   public var modelCatalog: [String]
   /// Runtime session IDs (`ses_...`) currently executing a turn, driven by
   /// `session.status` / `session.idle` engine events. The composer uses this
@@ -435,6 +439,7 @@ public struct KimiUIState: Codable, Equatable, Sendable {
     pendingPermissions: [KimiPermissionRequest] = [],
     lastError: String? = nil,
     selectedModel: String = KimiRuntimeIdentityStore.defaultModelID,
+    thinkingEffort: String = "Medium",
     modelCatalog: [String]? = nil,
     busySessionIDs: [String] = [],
     recentProjects: [String] = [],
@@ -455,6 +460,7 @@ public struct KimiUIState: Codable, Equatable, Sendable {
     self.pendingPermissions = pendingPermissions
     self.lastError = lastError
     self.selectedModel = selectedModel
+    self.thinkingEffort = thinkingEffort
     self.modelCatalog = modelCatalog ?? [selectedModel]
     self.busySessionIDs = busySessionIDs
     self.recentProjects = recentProjects
@@ -477,6 +483,7 @@ public struct KimiUIState: Codable, Equatable, Sendable {
     case pendingPermissions
     case lastError
     case selectedModel
+    case thinkingEffort
     case modelCatalog
     case busySessionIDs
     case recentProjects
@@ -501,6 +508,7 @@ public struct KimiUIState: Codable, Equatable, Sendable {
     lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
     let decodedModel = try container.decodeIfPresent(String.self, forKey: .selectedModel) ?? KimiRuntimeIdentityStore.defaultModelID
     selectedModel = decodedModel
+    thinkingEffort = try container.decodeIfPresent(String.self, forKey: .thinkingEffort) ?? "Medium"
     modelCatalog = try container.decodeIfPresent([String].self, forKey: .modelCatalog) ?? [decodedModel]
     // Busy markers describe in-flight engine turns; they never survive a
     // restart because the engine itself went away, so decode but drop stale

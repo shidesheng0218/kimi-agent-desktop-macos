@@ -126,7 +126,7 @@ struct KimiConversationPane: View {
 
       ScrollViewReader { proxy in
         ScrollView {
-          LazyVStack(alignment: .leading, spacing: 16) {
+          LazyVStack(alignment: .leading, spacing: 14) {
             if timeline.isEmpty {
               VStack(spacing: 10) {
                 Text("你好，我是 Kimi Code Agent").font(.title2.weight(.semibold))
@@ -168,7 +168,10 @@ struct KimiConversationPane: View {
                 .clipShape(RoundedRectangle(cornerRadius: 10))
             }
           }
-          .padding(24)
+          .padding(.horizontal, 24)
+          .padding(.vertical, 24)
+          .frame(maxWidth: 760)
+          .frame(maxWidth: .infinity)
         }
         .onChange(of: timeline.count) { _, _ in
           if let id = timeline.last?.id {
@@ -183,9 +186,12 @@ struct KimiConversationPane: View {
       }
 
       KimiComposerView(model: model)
-        .padding(18)
+        .frame(maxWidth: 760)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 18)
     }
-    .background(KimiDesign.background)
+    .background(KimiDesign.surface)
   }
 }
 
@@ -193,59 +199,121 @@ struct KimiMessageRow: View {
   let message: KimiMessage
 
   var body: some View {
-    HStack(alignment: .top, spacing: 12) {
-      Image(systemName: message.role == .user ? "person.circle.fill" : "sparkles")
-        .foregroundStyle(message.role == .user ? KimiDesign.muted : KimiDesign.primary)
-      Text(message.text)
+    if message.role == .user {
+      // User message: gray rounded pill, right-aligned like Claude Code
+      HStack {
+        Spacer(minLength: 40)
+        Text(message.text)
+          .font(.body)
+          .textSelection(.enabled)
+          .multilineTextAlignment(.leading)
+          .padding(.horizontal, 14)
+          .padding(.vertical, 10)
+          .background(KimiDesign.surfaceSecondary)
+          .clipShape(RoundedRectangle(cornerRadius: 14))
+      }
+    } else {
+      // Assistant message: no card background, icon + text
+      HStack(alignment: .top, spacing: 10) {
+        Image(systemName: "sparkles")
+          .font(.caption)
+          .foregroundStyle(KimiDesign.primary)
+          .frame(width: 16, height: 20)
+          .padding(.top, 2)
+        Group {
+          if let attributed = try? AttributedString(markdown: message.text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+            Text(attributed)
+          } else {
+            Text(message.text)
+          }
+        }
+        .font(.body)
         .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
+      }
     }
-    .padding(14)
-    .background(message.role == .user ? KimiDesign.surface : KimiDesign.surfaceSecondary)
-    .clipShape(RoundedRectangle(cornerRadius: KimiDesign.radius))
   }
 }
 
 struct KimiActivityCard: View {
   let activity: KimiActivity
+  @State private var isExpanded = false
 
   private var imageArtifacts: [URL] {
     guard let detail = activity.detail else { return [] }
     return KimiArtifactImages.extract(from: [detail])
   }
 
+  private var dotColor: Color {
+    switch activity.state {
+    case .failed: return .red
+    case .completed: return KimiDesign.primary
+    default: return KimiDesign.muted
+    }
+  }
+
+  private var hasDetail: Bool {
+    (activity.detail?.isEmpty == false) || !imageArtifacts.isEmpty
+  }
+
   var body: some View {
-    DisclosureGroup {
-      VStack(alignment: .leading, spacing: 8) {
-        if let detail = activity.detail {
-          Text(detail)
-            .font(.caption)
-            .foregroundStyle(KimiDesign.muted)
-            .textSelection(.enabled)
-            .padding(.top, 5)
-        }
-        ForEach(imageArtifacts, id: \.self) { url in
-          if let image = NSImage(contentsOf: url) {
-            Image(nsImage: image)
-              .resizable()
-              .aspectRatio(contentMode: .fit)
-              .frame(maxWidth: 480)
-              .clipShape(RoundedRectangle(cornerRadius: 8))
+    VStack(alignment: .leading, spacing: 4) {
+      // Compact header row: dot + tool name, like Claude Code's ⏺ tool()
+      Button {
+        if hasDetail { isExpanded.toggle() }
+      } label: {
+        HStack(spacing: 8) {
+          Circle()
+            .fill(dotColor)
+            .frame(width: 7, height: 7)
+          Text(activity.title)
+            .font(.callout.weight(.medium))
+            .foregroundStyle(KimiDesign.text)
+          if activity.state != .completed {
+            Text(activity.state.rawValue)
+              .font(.caption2)
+              .foregroundStyle(KimiDesign.muted)
+          }
+          Spacer()
+          if hasDetail {
+            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+              .font(.caption2)
+              .foregroundStyle(KimiDesign.muted)
           }
         }
+        .contentShape(Rectangle())
       }
-    } label: {
-      HStack(spacing: 8) {
-        Image(systemName: activity.state == .completed ? "checkmark.circle.fill" : "gearshape.2")
-          .foregroundStyle(activity.state == .failed ? .red : KimiDesign.primary)
-        Text(activity.title).font(.subheadline.weight(.medium))
-        Spacer()
-        Text(activity.state.rawValue).font(.caption2).foregroundStyle(KimiDesign.muted)
+      .buttonStyle(.plain)
+
+      // Expandable detail, indented under the dot with a left rule
+      if isExpanded, hasDetail {
+        VStack(alignment: .leading, spacing: 8) {
+          if let detail = activity.detail, !detail.isEmpty {
+            Text(detail)
+              .font(.caption)
+              .foregroundStyle(KimiDesign.muted)
+              .textSelection(.enabled)
+          }
+          ForEach(imageArtifacts, id: \.self) { url in
+            if let image = NSImage(contentsOf: url) {
+              Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(maxWidth: 480)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+          }
+        }
+        .padding(.leading, 15)
+        .overlay(alignment: .leading) {
+          Rectangle()
+            .fill(KimiDesign.border)
+            .frame(width: 1)
+            .padding(.leading, 3)
+        }
       }
     }
-    .padding(12)
-    .background(KimiDesign.surface)
-    .clipShape(RoundedRectangle(cornerRadius: KimiDesign.radius))
+    .padding(.vertical, 2)
   }
 }
 

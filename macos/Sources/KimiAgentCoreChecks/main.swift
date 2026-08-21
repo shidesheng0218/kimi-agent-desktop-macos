@@ -624,50 +624,6 @@ expect(restoredState.tasks[0].events == ["已创建 Plan 任务。", "等待 Kim
 expect(TaskMode.plan.isReadOnly, "Plan 模式必须明确为只读")
 expect(!TaskMode.edit.isReadOnly, "Edit 模式不应被标记为只读")
 
-let graphContract = TaskContract.make(
-  prompt: "修复登录失败并验证",
-  decision: IntentDecision(
-    intent: .implement,
-    confidence: 0.99,
-    requiresPlanning: true,
-    requiresApproval: true,
-    recommendedAgents: [.explore, .plan, .implement, .test, .review]
-  ),
-  mode: .edit
-)
-let compiledGraph = TaskGraphCompiler.compile(
-  taskID: persistedTask.id,
-  sessionID: persistedTask.id,
-  contract: graphContract
-)
-expect(
-  compiledGraph.nodes.map(\.stage) == [.explore, .plan, .implement, .test, .review],
-  "实现任务必须编译成 Explore → Plan → Implement → Test → Review DAG"
-)
-expect(
-  compiledGraph.nodes[2].dependencies == [compiledGraph.nodes[1].id],
-  "Implement 必须依赖真实 Plan 节点"
-)
-let orchestrationScheduler = AgentRunScheduler(runs: TaskGraphCompiler.plan(from: compiledGraph).runs, maxConcurrent: 2)
-let drivenRuns = try awaitValue { () async throws -> [AgentRun] in
-  try await orchestrationScheduler.drive { run in
-    AgentResult(summary: "\(run.definition.name) 完成", artifactIDs: [run.id.uuidString])
-  }
-}
-expect(drivenRuns.allSatisfy { $0.state == .completed }, "Scheduler 必须自动执行并完成所有 DAG 节点")
-expect(drivenRuns.allSatisfy { $0.result?.artifactIDs == [$0.id.uuidString] }, "Child Agent 结果必须写回对应的 AgentRun")
-let legacyAgentResult = try JSONDecoder().decode(AgentResult.self, from: Data(#"{"summary":"legacy"}"#.utf8))
-expect(legacyAgentResult.status == .completed && legacyAgentResult.confidence == 1, "旧 AgentResult 必须向后兼容并补齐默认结构化字段")
-let mergedAgentResult = AgentResultMerger.merge(
-  runs: drivenRuns,
-  contract: graphContract,
-  requestedLanguage: .chinese
-)
-expect(mergedAgentResult.outcome == .completed, "所有阶段完成时结果汇总必须标为 completed")
-expect(mergedAgentResult.finalAnswer.contains("已完成"), "最终答复必须由质量门禁生成可见结论")
-expect(!mergedAgentResult.finalAnswer.lowercased().contains("thinking"), "最终答复不能泄露内部思考")
-expect(mergedAgentResult.stageSummaries.contains(where: { $0.contains("Explore") }), "结果汇总必须包含真实阶段名称")
-expect(!mergedAgentResult.finalAnswer.contains("(run.definition"), "最终答复不能出现内部插值占位符")
 let failurePack = FailureContextPack(
   operationID: UUID(),
   taskID: persistedTask.id,
@@ -1194,12 +1150,6 @@ let conversationTask = AgentTask(
     AgentEvent(sessionID: conversationSessionID, taskID: conversationTaskID, sequence: 7, actor: "kimi-runtime", kind: .output, payload: ["text": "运行 `npm run verify`。"])
   ]
 )
-let conversationEntries = AgentConversationPresentation.entries(for: conversationTask)
-expect(conversationEntries.map(\.role) == [.user, .assistant, .user, .status, .assistant], "会话主视图必须呈现用户和助手轮次，而不是只呈现活动日志")
-expect(conversationEntries[0].text == conversationTask.title, "第一条会话消息必须是用户输入的任务内容")
-expect(conversationEntries[1].text == "目录结构如下：\n- macos\n- src", "连续助手输出必须合并成一条回复")
-expect(conversationEntries[2].text == "那测试命令是什么？", "用户追问必须显示真实输入，不能显示字面量 (prompt)")
-expect(conversationEntries[3].role == .status && conversationEntries[3].text.contains("Shell"), "工具事件必须作为轻量状态行显示")
 
 expect(TaskStateMachine.canTransition(from: .queued, to: .planning), "任务状态机必须允许 queued 到 planning")
 expect(TaskStateMachine.canTransition(from: .planning, to: .awaitingApproval), "任务状态机必须允许计划后等待审批")

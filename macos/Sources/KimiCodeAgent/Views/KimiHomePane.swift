@@ -18,7 +18,6 @@ struct KimiHomePane: View {
     ScrollView {
       VStack(alignment: .leading, spacing: 22) {
         header
-        quickComposer
         controls
         if tab == .overview {
           statsGrid
@@ -26,7 +25,7 @@ struct KimiHomePane: View {
         } else {
           modelsCard
         }
-        recentSessions
+        quickComposer
       }
       .padding(32)
       .frame(maxWidth: 960)
@@ -157,32 +156,32 @@ struct KimiHomePane: View {
                    icon: "cpu", tint: KimiDesign.accent),
     ]
     return LazyVGrid(
-      columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4),
-      spacing: 12
+      columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4),
+      spacing: 8
     ) {
       ForEach(cards) { card in
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
           Image(systemName: card.icon)
-            .font(.subheadline)
+            .font(.caption)
             .foregroundStyle(card.tint)
-            .frame(width: 30, height: 30)
+            .frame(width: 24, height: 24)
             .background(card.tint.opacity(0.12))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
           Text(card.value)
-            .font(.system(size: 20, weight: .bold))
+            .font(.system(size: 16, weight: .semibold))
             .foregroundStyle(KimiDesign.text)
             .lineLimit(1)
-            .minimumScaleFactor(0.55)
+            .minimumScaleFactor(0.6)
           Text(card.title)
-            .font(.caption)
+            .font(.caption2)
             .foregroundStyle(KimiDesign.muted)
         }
-        .padding(14)
+        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(KimiDesign.surface)
-        .clipShape(RoundedRectangle(cornerRadius: KimiDesign.radius))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
         .overlay(
-          RoundedRectangle(cornerRadius: KimiDesign.radius)
+          RoundedRectangle(cornerRadius: 10)
             .stroke(KimiDesign.border, lineWidth: 1)
         )
       }

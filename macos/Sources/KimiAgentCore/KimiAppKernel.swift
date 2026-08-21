@@ -467,6 +467,12 @@ public actor KimiAppKernel {
         persistState()
       }
 
+    case let .changeThinkingEffort(effort):
+      let trimmed = effort.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty, trimmed != state.thinkingEffort else { break }
+      state.thinkingEffort = trimmed
+      persistState()
+
     case .restartRuntime:
       if let runtimeSupervisor {
         _ = try await runtimeSupervisor.restart()

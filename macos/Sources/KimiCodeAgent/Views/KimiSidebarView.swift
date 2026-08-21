@@ -3,6 +3,7 @@ import KimiAgentCore
 
 struct KimiSidebarView: View {
   @ObservedObject var model: KimiAppViewModel
+  var onConfigureAPIKey: (() -> Void)? = nil
 
   var body: some View {
     VStack(alignment: .leading, spacing: 14) {
@@ -95,7 +96,7 @@ struct KimiSidebarView: View {
             .font(.subheadline)
             .foregroundStyle(KimiDesign.text)
             .lineLimit(1)
-          Text(session.updatedAt, style: .relative)
+          Text(relativeTime(from: session.updatedAt))
             .font(.caption2)
             .foregroundStyle(KimiDesign.muted)
         }
@@ -128,6 +129,8 @@ struct KimiSidebarView: View {
       }
       Spacer()
       Menu {
+        Button("配置 API 密钥") { onConfigureAPIKey?() }
+        Divider()
         Button("重启运行时", action: model.restartRuntime)
       } label: {
         Image(systemName: "gearshape")
@@ -167,5 +170,20 @@ struct KimiSidebarView: View {
 
   private var userInitial: String {
     String(userName.prefix(1)).uppercased()
+  }
+
+  /// 计算静态的相对时间字符串，不会持续更新
+  private func relativeTime(from date: Date) -> String {
+    let seconds = Int(Date().timeIntervalSince(date))
+    if seconds < 60 { return "\(seconds)秒" }
+    let minutes = seconds / 60
+    if minutes < 60 { return "\(minutes)分钟" }
+    let hours = minutes / 60
+    if hours < 24 { return "\(hours)小时" }
+    let days = hours / 24
+    if days < 30 { return "\(days)天" }
+    let months = days / 30
+    if months < 12 { return "\(months)个月" }
+    return "\(months / 12)年"
   }
 }
