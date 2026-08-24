@@ -76,11 +76,6 @@ public enum KimiHeadlessRuntimeFactory {
     let modelEntries = tableModelIDs.map { id in
       (id, ["name": id, "reasoning": true, "tool_call": true, "interleaved": "reasoning_content", "limit": ["context": 262_144, "output": 16_384], "modalities": ["input": ["text", "image"], "output": ["text"]]] as [String: Any])
     }
-    let baseURL = environment["KIMI_BASE_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-      ? environment["KIMI_BASE_URL"]!
-      : KimiRuntimeIdentityStore.defaultBaseURL
-    let apiKey = environment["KIMI_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-      ?? (try? MacKeychainCredentialVault().read(key: "kimi.runtime.identity.apiKey")) ?? ""
     let commandArguments: [String]
     let executableURL: URL
     if let nativeRuntimeBinaryURL {
@@ -101,25 +96,72 @@ public enum KimiHeadlessRuntimeFactory {
       "KIMI_NATIVE_BRIDGE": bridge,
       "KIMI_APPLICATION_SUPPORT_DIR": applicationSupportDirectory.path
     ]
-    if !apiKey.isEmpty { runtimeEnvironment["KIMI_API_KEY"] = apiKey }
-    let config: [String: Any] = [
+
+    // Build the engine's provider map: one entry per provider. The currently
+    // selected provider (KimiRuntimeIdentityStore.providerID) always gets an
+    // entry even when no credential is stored yet, because model/small_model
+    // references it and the engine would fail validation without it. Other
+    // providers only get an entry when they have a credential in Keychain.
+    var providerEntries: [String: [String: Any]] = [:]
+    for descriptor in KimiProviderCatalog.descriptors {
+      let credentialKey = "kimi.runtime.identity.apiKey.\(descriptor.id)"
+      let key = (try? MacKeychainCredentialVault().read(key: credentialKey))?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let hasCredential = !(key?.isEmpty ?? true)
+      let isSelectedProvider = descriptor.id == KimiRuntimeIdentityStore.providerID
+      guard hasCredential || isSelectedProvider else { continue }
+      if hasCredential, let credential = key {
+        runtimeEnvironment[descriptor.apiKeyEnvVar] = credential
+      }
+      let modelEntries = descriptor.modelIDs.map { id in
+        (id, ["name": id, "reasoning": true, "tool_call": true, "interleaved": "reasoning_content", "limit": ["context": 262144, "output": 16384], "modalities": ["input": ["text", "image"], "output": ["text"]]] as [String: Any])
+      }
+      providerEntries[descriptor.id] = [
+        "name": descriptor.displayName,
+        "api": descriptor.defaultBaseURL,
+        "npm": descriptor.npmPackage,
+        "env": [descriptor.apiKeyEnvVar],
+        "options": ["apiKey": "{env:\(descriptor.apiKeyEnvVar)}", "baseURL": descriptor.defaultBaseURL, "timeout": 120000, "headerTimeout": 15000, "chunkTimeout": 30000, "setCacheKey": true],
+        "models": Dictionary(uniqueKeysWithValues: modelEntries)
+      ]
+    }
+
+    // The currently selected model must exist in its provider's models table
+    // or per-prompt ModelRef validation fails engine-side. Merge the selected
+    // model entries (from modelCatalog + modelID) into the matching provider's
+    // models, preserving the preset entries already there.
+    let selectedProviderID = KimiRuntimeIdentityStore.providerID
+    if var selectedProvider = providerEntries[selectedProviderID] {
+      var models = selectedProvider["models"] as? [String: [String: Any]] ?? [:]
+      for (id, entry) in Dictionary(uniqueKeysWithValues: modelEntries) {
+        if models[id] == nil { models[id] = entry }
+      }
+      selectedProvider["models"] = models
+      providerEntries[selectedProviderID] = selectedProvider
+    }
+
+    // Load persisted MCP server list and build the engine's `mcp` config
+    // block. Only enabled servers are included. Field names match the engine
+    // schema exactly (command/environment/type, not cmd/env/stdio).
+    var mcpEntries: [String: [String: Any]] = [:]
+    let mcpStore = KimiMCPServerStore(fileURL: applicationSupportDirectory.appendingPathComponent("settings/mcp-servers.json"))
+    if let mcpServers = try? mcpStore.load() {
+      for server in mcpServers where server.enabled {
+        mcpEntries[server.id] = server.toEngineConfig()
+      }
+    }
+
+    var config: [String: Any] = [
       "model": "\(KimiRuntimeIdentityStore.providerID)/\(modelID)",
       "small_model": "\(KimiRuntimeIdentityStore.providerID)/\(modelID)",
       "plugin": ["{env:KIMI_RUNTIME_PLUGIN}"],
-      "provider": [
-        KimiRuntimeIdentityStore.providerID: [
-          "name": "Kimi / Moonshot AI",
-          "api": baseURL,
-          "npm": "@ai-sdk/openai-compatible",
-          "env": ["KIMI_API_KEY"],
-          "options": ["apiKey": "{env:KIMI_API_KEY}", "baseURL": baseURL, "timeout": 120000, "headerTimeout": 15000, "chunkTimeout": 30000, "setCacheKey": true],
-          "models": Dictionary(uniqueKeysWithValues: modelEntries)
-        ]
-      ],
+      "provider": providerEntries,
       "permission": ["read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "websearch": "allow", "webfetch": "allow", "task": "allow", "bash": "ask", "edit": "ask", "external_directory": "ask", "question": "ask", "skill": "ask"],
       "compaction": ["auto": true, "prune": true, "tail_turns": 8, "preserve_recent_tokens": 24000],
       "tool_output": ["max_lines": 2000, "max_bytes": 51200]
     ]
+    if !mcpEntries.isEmpty {
+      config["mcp"] = mcpEntries
+    }
     if let data = try? JSONSerialization.data(withJSONObject: config, options: [.sortedKeys]),
        let text = String(data: data, encoding: .utf8) {
       runtimeEnvironment["OPENCODE_CONFIG_CONTENT"] = text

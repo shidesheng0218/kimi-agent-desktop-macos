@@ -125,6 +125,10 @@ public protocol KimiRuntimeSessionClient: Sendable {
   func summarize(sessionID: String, modelID: String, directory: String?) async throws
   func fetchMcpStatus(directory: String?) async throws -> [KimiMcpServerStatus]
   func fetchSkills(directory: String?) async throws -> [KimiSkillSummary]
+  /// Adds an MCP server at runtime via POST /mcp, without restarting the engine.
+  func addMCPServer(_ entry: KimiMCPServerEntry, directory: String?) async throws
+  /// Disconnects an MCP server via POST /mcp/{name}/disconnect, without restart.
+  func removeMCPServer(name: String, directory: String?) async throws
   /// Engine-side busy/idle map (`GET /session/status`), used to reconcile UI
   /// state after an event-stream reconnect where a completion frame may have
   /// been missed.
@@ -146,6 +150,8 @@ public extension KimiRuntimeSessionClient {
   func summarize(sessionID: String, modelID: String, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   func fetchMcpStatus(directory: String?) async throws -> [KimiMcpServerStatus] { [] }
   func fetchSkills(directory: String?) async throws -> [KimiSkillSummary] { [] }
+  func addMCPServer(_ entry: KimiMCPServerEntry, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
+  func removeMCPServer(name: String, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   func fetchSessionStatuses(directory: String?) async throws -> [String: String] { [:] }
 }
 
@@ -323,6 +329,27 @@ public final class URLSessionRuntimeClient: KimiRuntimeSessionClient, @unchecked
       guard let name = item["name"] as? String, !name.isEmpty else { return nil }
       return KimiSkillSummary(name: name, description: item["description"] as? String)
     }
+  }
+
+  public func addMCPServer(_ entry: KimiMCPServerEntry, directory: String?) async throws {
+    // POST /mcp adds the server at runtime without restarting the engine.
+    // Body shape: { name: <server id>, config: <engine mcp schema object> }
+    _ = try await requestData(
+      path: "/mcp",
+      method: "POST",
+      query: directoryQuery(directory),
+      body: ["name": entry.id, "config": entry.toEngineConfig()]
+    )
+  }
+
+  public func removeMCPServer(name: String, directory: String?) async throws {
+    // POST /mcp/{name}/disconnect disconnects the server at runtime.
+    _ = try await requestData(
+      path: "/mcp/\(name)/disconnect",
+      method: "POST",
+      query: directoryQuery(directory),
+      body: nil
+    )
   }
 
   public func fetchSessionStatuses(directory: String?) async throws -> [String: String] {

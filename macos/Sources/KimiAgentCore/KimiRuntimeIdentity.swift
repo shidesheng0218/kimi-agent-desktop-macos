@@ -58,8 +58,9 @@ public final class KimiRuntimeIdentityStore: @unchecked Sendable {
   }
 
   public func record() throws -> KimiRuntimeIdentityRecord {
+    try migrateIfNeeded()
     let stored = try loadMetadata()
-    let hasAPIKey = !(try vault.read(key: apiKeyKey)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    let hasAPIKey = !(try configuredProviderIDs().isEmpty)
     var record = stored ?? KimiRuntimeIdentityRecord(mode: hasAPIKey ? .apiKey : .kimiCode)
     if record.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == Self.legacyDefaultBaseURL {
       record.baseURL = Self.defaultBaseURL
@@ -82,7 +83,7 @@ public final class KimiRuntimeIdentityStore: @unchecked Sendable {
 
     let normalizedBaseURL = try normalizeBaseURL(baseURL)
     let normalizedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? Self.defaultModelID
-    try vault.write(trimmedKey, key: apiKeyKey)
+    try saveAPIKey(trimmedKey, for: Self.providerID)
     try writeMetadata(KimiRuntimeIdentityRecord(
       mode: .apiKey,
       baseURL: normalizedBaseURL,
@@ -111,7 +112,7 @@ public final class KimiRuntimeIdentityStore: @unchecked Sendable {
 
   public func disconnectAPI(applicationSupportDirectory: URL? = nil) throws {
     var record = try self.record()
-    try vault.delete(key: apiKeyKey)
+    try deleteAPIKey(for: Self.providerID)
     record.mode = .kimiCode
     record.apiKeyStatus = "missing"
     record.updatedAt = .now
@@ -124,7 +125,57 @@ public final class KimiRuntimeIdentityStore: @unchecked Sendable {
   }
 
   public func apiKey() throws -> String? {
-    try vault.read(key: apiKeyKey)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    try apiKey(for: Self.providerID)
+  }
+
+  /// Reads the credential for a specific provider, or nil when none is stored.
+  public func apiKey(for providerID: String) throws -> String? {
+    try vault.read(key: apiKeyKey(for: providerID))?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+  }
+
+  /// Saves a credential for a specific provider, keyed by that provider's ID.
+  public func saveAPIKey(_ apiKey: String, for providerID: String) throws {
+    let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      throw NSError(domain: "KimiRuntimeIdentityStore", code: 6, userInfo: [NSLocalizedDescriptionKey: "API Key 不能为空。"])
+    }
+    try vault.write(trimmed, key: apiKeyKey(for: providerID))
+  }
+
+  /// Deletes the credential for a specific provider.
+  public func deleteAPIKey(for providerID: String) throws {
+    try vault.delete(key: apiKeyKey(for: providerID))
+  }
+
+  /// Returns the IDs of all providers that currently have a credential stored.
+  /// Keychain doesn't support enumeration, so this checks a static list of known
+  /// provider IDs; unknown providers' keys can't be discovered.
+  public func configuredProviderIDs() throws -> [String] {
+    var configured: [String] = []
+    for descriptor in KimiProviderCatalog.descriptors {
+      if try apiKey(for: descriptor.id) != nil {
+        configured.append(descriptor.id)
+      }
+    }
+    return configured
+  }
+
+  /// One-time migration: copy the legacy single credential (written before
+  /// multi-provider support) into the default provider's bucket, then delete
+  /// the legacy key. Idempotent — running it twice has no additional effect,
+  /// and if the target bucket already has a credential the legacy key is left
+  /// alone so nothing is ever silently lost.
+  public func migrateIfNeeded() throws {
+    guard let legacyValue = try vault.read(key: legacyAPIKeyKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !legacyValue.isEmpty else {
+      return
+    }
+    let defaultBucketKey = apiKeyKey(for: Self.providerID)
+    let existing = try vault.read(key: defaultBucketKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if existing == nil || existing!.isEmpty {
+      try vault.write(legacyValue, key: defaultBucketKey)
+    }
+    try vault.delete(key: legacyAPIKeyKey)
   }
 
   public func runtimeEnvironment(
@@ -266,8 +317,14 @@ public final class KimiRuntimeIdentityStore: @unchecked Sendable {
     "kimi.runtime.identity.metadata"
   }
 
-  private var apiKeyKey: String {
+  /// Legacy single-credential key kept for one-time migration only. New code
+  /// always writes via `apiKeyKey(for:)`.
+  private var legacyAPIKeyKey: String {
     "kimi.runtime.identity.apiKey"
+  }
+
+  private func apiKeyKey(for providerID: String) -> String {
+    "kimi.runtime.identity.apiKey.\(providerID)"
   }
 }
 

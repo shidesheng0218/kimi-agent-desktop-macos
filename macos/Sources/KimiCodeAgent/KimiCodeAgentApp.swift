@@ -470,10 +470,17 @@ enum KimiDesign {
 struct KimiRootView: View {
   @ObservedObject var model: KimiAppViewModel
   @State private var showAPIKeySetup = false
+  @State private var showProviderSettings = false
+  @State private var showMCPServers = false
 
   var body: some View {
     HStack(spacing: 0) {
-      KimiSidebarView(model: model, onConfigureAPIKey: { showAPIKeySetup = true })
+      KimiSidebarView(
+        model: model,
+        onConfigureAPIKey: { showAPIKeySetup = true },
+        onConfigureProviders: { showProviderSettings = true },
+        onConfigureMCPServers: { showMCPServers = true }
+      )
         .frame(width: 260)
       Divider()
       if model.state.activeSessionID == nil {
@@ -491,6 +498,12 @@ struct KimiRootView: View {
     .preferredColorScheme(.light)
     .sheet(isPresented: $showAPIKeySetup) {
       KimiAPIKeySetupView(model: model, isPresented: $showAPIKeySetup)
+    }
+    .sheet(isPresented: $showProviderSettings) {
+      KimiProviderSettingsView(model: model, isPresented: $showProviderSettings)
+    }
+    .sheet(isPresented: $showMCPServers) {
+      KimiMCPServersView(model: model, isPresented: $showMCPServers)
     }
     .onAppear {
       // Auto-show setup if no key is configured

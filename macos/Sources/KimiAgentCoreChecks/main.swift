@@ -1131,6 +1131,73 @@ expect(
   KimiRuntimeConnectionGuidance.modelExample().contains("kimi-k2.7-code"),
   "模型示例必须给出默认模型"
 )
+
+// Multi-provider credential bucket tests
+let multiProviderVault = InMemoryCredentialVault()
+let multiProviderStore = KimiRuntimeIdentityStore(vault: multiProviderVault)
+try multiProviderStore.saveAPIKey("sk-moonshot", for: "moonshotai-cn")
+try multiProviderStore.saveAPIKey("sk-openai", for: "openai")
+let moonshotKey = try multiProviderStore.apiKey(for: "moonshotai-cn")
+expect(
+  moonshotKey == "sk-moonshot",
+  "分桶存储后必须能按 provider ID 读取对应 key"
+)
+let openaiKey = try multiProviderStore.apiKey(for: "openai")
+expect(
+  openaiKey == "sk-openai",
+  "分桶存储后必须能按 provider ID 读取另一个 provider 的 key"
+)
+let anthropicKey = try multiProviderStore.apiKey(for: "anthropic")
+expect(
+  anthropicKey == nil,
+  "未配置的 provider 读取时必须返回 nil，不能返回其他 provider 的 key"
+)
+let configuredIDs = try multiProviderStore.configuredProviderIDs().sorted()
+expect(
+  configuredIDs == ["moonshotai-cn", "openai"].sorted(),
+  "configuredProviderIDs 必须列出所有已配置凭据的 provider ID"
+)
+try multiProviderStore.deleteAPIKey(for: "openai")
+let deletedOpenaiKey = try multiProviderStore.apiKey(for: "openai")
+expect(
+  deletedOpenaiKey == nil,
+  "删除某个 provider 的 key 后读取时必须返回 nil"
+)
+let remainingIDs = try multiProviderStore.configuredProviderIDs()
+expect(
+  remainingIDs == ["moonshotai-cn"],
+  "删除后 configuredProviderIDs 必须只反映剩余已配置的 provider"
+)
+
+// Migration from legacy single-credential key
+let migrationVault = InMemoryCredentialVault()
+let migrationStore = KimiRuntimeIdentityStore(vault: migrationVault)
+// Manually write to the legacy single key to simulate an old install
+try migrationVault.write("sk-legacy", key: "kimi.runtime.identity.apiKey")
+let migratedRecord = try migrationStore.record()
+expect(
+  migratedRecord.apiKeyStatus == "configured",
+  "迁移后 apiKeyStatus 必须反映至少一个 provider 已配置"
+)
+let migratedKey = try migrationStore.apiKey(for: KimiRuntimeIdentityStore.providerID)
+expect(
+  migratedKey == "sk-legacy",
+  "迁移后旧 key 必须出现在默认 provider 的分桶里"
+)
+// Legacy key should be deleted after migration
+let legacyKeyAfterMigration = try migrationVault.read(key: "kimi.runtime.identity.apiKey")
+expect(
+  legacyKeyAfterMigration == nil,
+  "迁移后旧单一 key 必须被删除"
+)
+// Migration must be idempotent: running it again doesn't duplicate or corrupt
+try migrationStore.migrateIfNeeded()
+let migratedKeyAgain = try migrationStore.apiKey(for: KimiRuntimeIdentityStore.providerID)
+expect(
+  migratedKeyAgain == "sk-legacy",
+  "重复迁移不能覆盖已存在的新 key"
+)
+
 expect(
   KimiModelCatalogClient.fallbackModels().map(\.id) == ["kimi-k2.7-code", "kimi-k3"],
   "模型列表在无法刷新时必须仍然提供默认候选模型"
@@ -3247,6 +3314,92 @@ expect(headlessFactoryConfiguration?.environment["XDG_DATA_HOME"]?.hasSuffix("ru
   && headlessFactoryConfiguration?.environment["XDG_STATE_HOME"]?.hasSuffix("runtime/state") == true,
   "Headless 引擎的所有可写目录必须收编进 Application Support/runtime，禁止泄漏到 ~/.config 或 ~/.local")
 expect(headlessFactoryConfig["$schema"] == nil, "引擎配置不得携带暴露来源的 $schema 链接")
+
+// MCP server entry engine config schema validation
+let localMcpEntry = KimiMCPServerEntry(
+  id: "filesystem",
+  transport: .local,
+  enabled: true,
+  command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+  cwd: "/tmp/work",
+  environment: ["API_KEY": "secret"],
+  timeout: 10000
+)
+let localMcpConfig = localMcpEntry.toEngineConfig()
+expect(localMcpConfig["type"] as? String == "local", "MCP local 配置必须包含 type=local")
+expect(localMcpConfig["command"] as? [String] == ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"], "MCP local 配置必须使用 command 字段（不是 cmd）")
+expect(localMcpConfig["environment"] as? [String: String] == ["API_KEY": "secret"], "MCP local 配置必须使用 environment 字段（不是 env）")
+expect(localMcpConfig["cwd"] as? String == "/tmp/work", "MCP local 配置必须保留 cwd")
+expect(localMcpConfig["timeout"] as? Int == 10000, "MCP local 配置必须保留 timeout")
+expect(localMcpConfig["enabled"] as? Bool == true, "MCP local 配置必须保留 enabled")
+
+let remoteMcpEntry = KimiMCPServerEntry(
+  id: "remote-api",
+  transport: .remote,
+  enabled: true,
+  url: "https://mcp.example.com/sse",
+  headers: ["Authorization": "Bearer token123"]
+)
+let remoteMcpConfig = remoteMcpEntry.toEngineConfig()
+expect(remoteMcpConfig["type"] as? String == "remote", "MCP remote 配置必须包含 type=remote（不是 sse/http）")
+expect(remoteMcpConfig["url"] as? String == "https://mcp.example.com/sse", "MCP remote 配置必须保留 url")
+expect(remoteMcpConfig["headers"] as? [String: String] == ["Authorization": "Bearer token123"], "MCP remote 配置必须保留 headers")
+
+// MCP server store persistence
+let mcpStoreURL = temporaryDirectory.appendingPathComponent("mcp-store-test/mcp-servers.json")
+let mcpStore = KimiMCPServerStore(fileURL: mcpStoreURL)
+try mcpStore.save([localMcpEntry, remoteMcpEntry])
+let loadedMcpServers = try mcpStore.load()
+expect(loadedMcpServers.count == 2, "MCP 服务器配置必须能持久化并读回")
+expect(loadedMcpServers.first?.id == "filesystem", "MCP 服务器配置读回时必须保留服务器 ID")
+expect(loadedMcpServers.first?.transport == .local, "MCP 服务器配置读回时必须保留 transport 类型")
+expect(loadedMcpServers.first?.command == ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"], "MCP 服务器配置读回时必须保留 command 数组")
+
+// MCP config generation in KimiHeadlessRuntimeFactory
+let mcpFactorySupport = temporaryDirectory.appendingPathComponent("mcp-factory-support", isDirectory: true)
+let mcpFactoryStore = KimiMCPServerStore(fileURL: mcpFactorySupport.appendingPathComponent("settings/mcp-servers.json"))
+try mcpFactoryStore.save([localMcpEntry])
+let mcpFactoryConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: mcpFactorySupport,
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+  ]
+)
+let mcpFactoryConfigJSON = mcpFactoryConfig?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
+let mcpFactoryConfigObj = (try? JSONSerialization.jsonObject(with: Data(mcpFactoryConfigJSON.utf8)) as? [String: Any]) ?? [:]
+let generatedMcpBlock = mcpFactoryConfigObj["mcp"] as? [String: Any]
+expect(generatedMcpBlock != nil, "KimiHeadlessRuntimeFactory 必须在 OPENCODE_CONFIG_CONTENT 中生成 mcp 配置块")
+expect(generatedMcpBlock?["filesystem"] != nil, "生成的 mcp 配置块必须包含已配置的服务器")
+let generatedFilesystemConfig = generatedMcpBlock?["filesystem"] as? [String: Any]
+expect(generatedFilesystemConfig?["type"] as? String == "local", "生成的服务器配置必须包含 type=local")
+expect(generatedFilesystemConfig?["command"] as? [String] == ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"], "生成的服务器配置必须保留 command 数组")
+expect(generatedFilesystemConfig?["environment"] as? [String: String] == ["API_KEY": "secret"], "生成的服务器配置必须保留 environment")
+
+// Disabled servers must not be included in the generated config
+let disabledMcpEntry = KimiMCPServerEntry(
+  id: "disabled-server",
+  transport: .local,
+  enabled: false,
+  command: ["npx", "test"]
+)
+try mcpFactoryStore.save([localMcpEntry, disabledMcpEntry])
+let mcpFactoryConfig2 = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: mcpFactorySupport,
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+  ]
+)
+let mcpFactoryConfigJSON2 = mcpFactoryConfig2?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
+let mcpFactoryConfigObj2 = (try? JSONSerialization.jsonObject(with: Data(mcpFactoryConfigJSON2.utf8)) as? [String: Any]) ?? [:]
+let generatedMcpBlock2 = mcpFactoryConfigObj2["mcp"] as? [String: Any]
+expect(generatedMcpBlock2?["disabled-server"] == nil, "禁用的 MCP 服务器不得出现在生成的配置块中")
+expect(generatedMcpBlock2?["filesystem"] != nil, "启用的 MCP 服务器必须仍然出现在配置块中")
 
 // Runtime data migration: legacy XDG locations must fold into the contained
 // runtime directory without overwriting anything.

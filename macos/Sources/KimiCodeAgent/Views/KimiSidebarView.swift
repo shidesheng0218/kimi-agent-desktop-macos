@@ -4,6 +4,8 @@ import KimiAgentCore
 struct KimiSidebarView: View {
   @ObservedObject var model: KimiAppViewModel
   var onConfigureAPIKey: (() -> Void)? = nil
+  var onConfigureProviders: (() -> Void)? = nil
+  var onConfigureMCPServers: (() -> Void)? = nil
 
   var body: some View {
     VStack(alignment: .leading, spacing: 14) {
@@ -130,6 +132,8 @@ struct KimiSidebarView: View {
       Spacer()
       Menu {
         Button("配置 API 密钥") { onConfigureAPIKey?() }
+        Button("模型提供商") { onConfigureProviders?() }
+        Button("MCP 服务器") { onConfigureMCPServers?() }
         Divider()
         Button("重启运行时", action: model.restartRuntime)
       } label: {
