@@ -839,63 +839,6 @@ public final class SearxNGWebSearchProvider: WebSearchExecutingProvider, @unchec
   }
 }
 
-/// Converts native Web responses into the same ToolExecutionResult shape used
-/// by the Harness effect journal and final-answer evidence gate.
-public struct WebRuntimeToolExecutor: ToolExecutor {
-  private let runtime: WebRuntime
-
-  public init(runtime: WebRuntime) { self.runtime = runtime }
-
-  public func execute(_ request: ToolExecutionRequest) async throws -> ToolExecutionResult {
-    let input = request.inputJSON.objectValue ?? [:]
-    switch request.toolID {
-    case "web.search":
-      guard let query = input["query"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty else {
-        throw NativeHarnessToolError.missingInput("query")
-      }
-      let maxResults = input["max_results"]?.integerValue ?? input["maxResults"]?.integerValue ?? 8
-      let result = try await runtime.search(WebSearchRequest(query: query, maxResults: maxResults))
-      let sourcesJSON = try JSONEncoder().encode(result.sources)
-      let output = result.sources.map { source in
-        let snippet = source.snippet.isEmpty ? "" : " — \(source.snippet)"
-        return "- [\(source.title)](\(source.url))\(snippet)"
-      }.joined(separator: "\n")
-      return ToolExecutionResult(
-        output: output.isEmpty ? "未找到公开来源。" : output,
-        metadata: [
-          "webResearchAction": "search",
-          "provider": result.providerID,
-          "sources": String(data: sourcesJSON, encoding: .utf8) ?? "[]",
-          "fallback": result.fallbackUsed ? "true" : "false",
-          "elapsedMS": String(result.elapsedMilliseconds)
-        ]
-      )
-    case "web.fetch":
-      guard let url = input["url"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty else {
-        throw NativeHarnessToolError.missingInput("url")
-      }
-      let sourceID = input["source_id"]?.stringValue ?? input["sourceID"]?.stringValue ?? input["sourceid"]?.stringValue
-      let maxCharacters = input["max_chars"]?.integerValue ?? input["maxChars"]?.integerValue ?? 100_000
-      let result = try await runtime.fetch(WebFetchRequest(url: url, sourceID: sourceID, maxCharacters: maxCharacters))
-      return ToolExecutionResult(
-        output: result.content,
-        metadata: [
-          "webResearchAction": "fetch",
-          "url": result.url,
-          "title": result.title,
-          "contentType": result.contentType,
-          "status": String(result.statusCode),
-          "truncated": result.truncated ? "true" : "false",
-          "elapsedMS": String(result.elapsedMilliseconds)
-        ],
-        exitCode: nil
-      )
-    default:
-      throw ToolExecutionError.unknownTool(request.toolID)
-    }
-  }
-}
-
 private extension String {
   var nonEmpty: String? { isEmpty ? nil : self }
 }
