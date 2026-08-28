@@ -4,6 +4,7 @@ import { readFile, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { removeExistingItem } from "./appcastDedup.mjs"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const appcastPath = path.join(root, "appcast.xml")
@@ -55,11 +56,12 @@ const header = [
 let content
 if (existsSync(appcastPath)) {
   const existing = await readFile(appcastPath, "utf8")
+  const withoutDuplicate = removeExistingItem(existing, build)
   const marker = "<language>zh-CN</language>"
-  const anchorIndex = existing.indexOf(marker)
+  const anchorIndex = withoutDuplicate.indexOf(marker)
   if (anchorIndex === -1) throw new Error("appcast.xml is missing its <language> anchor; refusing to rewrite")
   const insertAt = anchorIndex + marker.length
-  content = `${existing.slice(0, insertAt)}\n${item}\n${existing.slice(insertAt)}`
+  content = `${withoutDuplicate.slice(0, insertAt)}\n${item}\n${withoutDuplicate.slice(insertAt)}`
 } else {
   content = `${header}\n${item}\n  </channel>\n</rss>\n`
 }

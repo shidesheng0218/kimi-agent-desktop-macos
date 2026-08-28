@@ -113,7 +113,13 @@ public actor KimiRuntimeSupervisor {
   private var state: KimiRuntimeState = .stopped {
     didSet { publishState(state) }
   }
-  private var monitorTask: Task<Void, Never>?
+  /// Bumped every time `beginMonitoring` registers a termination handler for
+  /// a new process. `Process.terminationHandler` fires on an arbitrary
+  /// background thread and is bridged back onto the actor via `Task { ... }`,
+  /// so a handler for a since-superseded process (already stopped/restarted)
+  /// must be able to recognize it's stale and no-op instead of racing a
+  /// newer launch's state.
+  private var monitorGeneration = 0
   private var intentionalStop = false
   private var unexpectedExitRestarts = 0
   private var stateContinuations: [UUID: AsyncStream<KimiRuntimeState>.Continuation] = [:]
@@ -191,8 +197,7 @@ public actor KimiRuntimeSupervisor {
 
   public func stop() {
     intentionalStop = true
-    monitorTask?.cancel()
-    monitorTask = nil
+    monitorGeneration += 1
     guard let process else {
       state = .stopped
       return
@@ -259,40 +264,46 @@ public actor KimiRuntimeSupervisor {
     return false
   }
 
+  /// Replaces a 50ms busy-poll with `Process.terminationHandler`: the OS
+  /// notifies us exactly when the process dies instead of us asking
+  /// repeatedly. The handler fires on an arbitrary background thread, so it
+  /// only captures the generation token and hops back onto the actor via
+  /// `Task` before touching any actor-isolated state.
   private func beginMonitoring(_ handle: KimiProcessHandle) {
-    monitorTask?.cancel()
+    monitorGeneration += 1
+    let generation = monitorGeneration
     let pid = handle.processIdentifier
-    monitorTask = Task { [weak self] in
-      guard let self else { return }
-      await self.monitorUnexpectedExit(processID: pid)
+    handle.onTermination { [weak self] _ in
+      Task { [weak self] in
+        await self?.handleUnexpectedExit(processID: pid, generation: generation)
+      }
     }
   }
 
-  private func monitorUnexpectedExit(processID: Int32) async {
-    while !Task.isCancelled {
-      try? await Task.sleep(for: .milliseconds(50))
-      guard let current = process, current.processIdentifier == processID else { return }
-      guard !current.isRunning else { continue }
-      guard !intentionalStop else { return }
-      KimiEngineTerminationRegistry.shared.unregister(processIdentifier: processID)
-      guard unexpectedExitRestarts < configuration.restartLimit else {
-        state = .failed
-        return
-      }
-      unexpectedExitRestarts += 1
-      state = .starting
-      try? await Task.sleep(for: .seconds(configuration.restartDelay))
-      guard !Task.isCancelled, !intentionalStop else { return }
-      do {
-        _ = try launch(resetRestartCount: false)
-        // A relaunched engine must prove health before observers see `ready`;
-        // otherwise the state would sit in `.starting` forever and the UI
-        // would never re-subscribe to the event stream.
-        try await waitUntilReady()
-      } catch {
-        state = .failed
-      }
+  private func handleUnexpectedExit(processID: Int32, generation: Int) async {
+    // A termination handler for a process this supervisor has since moved
+    // past (stopped, or already relaunched into a newer generation) must
+    // no-op rather than race the current state.
+    guard generation == monitorGeneration else { return }
+    guard let current = process, current.processIdentifier == processID else { return }
+    guard !intentionalStop else { return }
+    KimiEngineTerminationRegistry.shared.unregister(processIdentifier: processID)
+    guard unexpectedExitRestarts < configuration.restartLimit else {
+      state = .failed
       return
+    }
+    unexpectedExitRestarts += 1
+    state = .starting
+    try? await Task.sleep(for: .seconds(configuration.restartDelay))
+    guard generation == monitorGeneration, !intentionalStop else { return }
+    do {
+      _ = try launch(resetRestartCount: false)
+      // A relaunched engine must prove health before observers see `ready`;
+      // otherwise the state would sit in `.starting` forever and the UI
+      // would never re-subscribe to the event stream.
+      try await waitUntilReady()
+    } catch {
+      state = .failed
     }
   }
 }

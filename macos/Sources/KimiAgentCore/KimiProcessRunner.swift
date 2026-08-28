@@ -71,6 +71,19 @@ public final class KimiProcessHandle: @unchecked Sendable {
     }
   }
 
+  /// Registers a callback fired exactly once when the underlying process
+  /// exits, for any reason (intentional terminate() or an unexpected crash).
+  /// `Process.terminationHandler` runs on an arbitrary background thread
+  /// (not necessarily the thread that called `run()`), so callers that need
+  /// actor isolation must hop back onto their own executor from inside the
+  /// handler — this method only guarantees the callback fires once, exactly
+  /// when the process dies, in place of a polling loop.
+  public func onTermination(_ handler: @escaping @Sendable (Int32) -> Void) {
+    process.terminationHandler = { finishedProcess in
+      handler(finishedProcess.terminationStatus)
+    }
+  }
+
   public func wait() -> KimiProcessResult {
     process.waitUntilExit()
     drain(stdoutPipe.fileHandleForReading, stream: .standardOutput)
