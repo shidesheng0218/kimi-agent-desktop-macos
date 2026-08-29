@@ -215,6 +215,14 @@ struct KimiMCPServersView: View {
     showEditor = true
   }
 
+  /// Persists to the on-disk config (so it survives the next engine
+  /// relaunch) and, if the server is enabled, also tries the engine's live
+  /// `POST /mcp` endpoint so it connects immediately without waiting for a
+  /// restart. The runtime add is best-effort: if the engine rejects it (e.g.
+  /// a malformed command, or the engine isn't running), the entry is still
+  /// saved to disk and will be picked up on the next restart via
+  /// `saveAndRestart()` — this mirrors `KimiHeadlessRuntimeFactory`'s config
+  /// generator, which is the source of truth for what loads at launch.
   private func saveServer(_ server: KimiMCPServerEntry) {
     do {
       try mcpStore.add(server)
@@ -222,9 +230,28 @@ struct KimiMCPServersView: View {
       errorMessage = nil
     } catch {
       errorMessage = "保存失败: \(error.localizedDescription)"
+      return
+    }
+    guard server.enabled else { return }
+    Task {
+      do {
+        try await model.kernel.addMCPServerAtRuntime(server)
+        await loadStatuses()
+      } catch {
+        // Best-effort: the entry is already saved to disk, so a runtime-add
+        // failure just means it activates on the next restart instead of
+        // immediately. Surface it without blocking the save the user asked
+        // for.
+        await MainActor.run {
+          errorMessage = "已保存，但立即连接失败（将在下次重启引擎时生效）: \(error.localizedDescription)"
+        }
+      }
     }
   }
 
+  /// Removes from the on-disk config and, best-effort, disconnects it from
+  /// the running engine immediately via `POST /mcp/{name}/disconnect` so it
+  /// stops appearing as connected without requiring a restart.
   private func deleteServer(_ server: KimiMCPServerEntry) {
     do {
       try mcpStore.remove(id: server.id)
@@ -232,6 +259,21 @@ struct KimiMCPServersView: View {
       errorMessage = nil
     } catch {
       errorMessage = "删除失败: \(error.localizedDescription)"
+      return
+    }
+    Task {
+      do {
+        try await model.kernel.removeMCPServerAtRuntime(name: server.id)
+        await loadStatuses()
+      } catch {
+        // Best-effort: the entry is already removed from disk, so it won't
+        // come back on the next restart even if the live disconnect failed
+        // (e.g. the engine wasn't running, or never had this server
+        // connected in the first place).
+        await MainActor.run {
+          errorMessage = "已删除配置，但断开运行中的连接失败: \(error.localizedDescription)"
+        }
+      }
     }
   }
 

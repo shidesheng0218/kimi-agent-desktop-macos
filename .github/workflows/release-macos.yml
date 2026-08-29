@@ -62,6 +62,39 @@ jobs:
           swift build --package-path macos --product KimiCodeAgent -Xswiftc -disable-batch-mode --jobs 1
           swift build --package-path macos --product KimiNativeBridge -Xswiftc -disable-batch-mode --jobs 1
 
+      # RestartRecoveryCheck is deterministic and needs no GUI/TCC permission
+      # (unlike BrowserSmokeCheck/ComputerUseSmokeCheck, which stay manual-only
+      # for that reason), so it's safe to run unattended in CI. phase1 runs in
+      # the background and is killed once it prints PHASE1_OK, confirming its
+      # mid-flight operation's events are durably on disk — simulating an app
+      # kill exactly as the tool's own comments describe. phase2 then re-opens
+      # the same state directory in a fresh process and asserts the recovery
+      # contract.
+      - name: Verify restart recovery
+        run: |
+          cd macos
+          swift build --product RestartRecoveryCheck -Xswiftc -disable-batch-mode --jobs 1
+          BIN="$(swift build --show-bin-path)/RestartRecoveryCheck"
+          STATE_DIR="$RUNNER_TEMP/restart-recovery-state"
+          rm -rf "$STATE_DIR"
+          "$BIN" phase1 "$STATE_DIR" > /tmp/phase1.log 2>&1 &
+          PHASE1_PID=$!
+          for _ in $(seq 1 50); do
+            grep -q PHASE1_OK /tmp/phase1.log 2>/dev/null && break
+            kill -0 "$PHASE1_PID" 2>/dev/null || { echo "phase1 exited early"; cat /tmp/phase1.log; exit 1; }
+            sleep 0.2
+          done
+          grep -q PHASE1_OK /tmp/phase1.log || { echo "phase1 never signaled PHASE1_OK within 10s"; cat /tmp/phase1.log; kill -9 "$PHASE1_PID" 2>/dev/null; exit 1; }
+          cat /tmp/phase1.log
+          # The process can occasionally exit on its own between PHASE1_OK
+          # being detected and this kill (observed locally with `bash: kill:
+          # No such process`); that's the *intended* mid-flight-kill outcome
+          # either way, so a failed kill here (already dead) must not fail
+          # the step under GitHub Actions' implicit `set -e`.
+          kill -9 "$PHASE1_PID" 2>/dev/null || true
+          wait "$PHASE1_PID" 2>/dev/null || true
+          "$BIN" phase2 "$STATE_DIR"
+
   release:
     name: Build and publish macOS release
     if: >-
@@ -183,22 +216,11 @@ jobs:
           unzip -t release-native/Kimi-Code-Agent-"$VERSION"-mac-*.zip
           hdiutil verify release-native/Kimi-Code-Agent-"$VERSION"-mac-*.dmg
 
-      # The packaging script prepends this release to appcast.xml; publish it
-      # back to master because SUFeedURL reads the feed from master's raw URL.
-      - name: Publish updated Sparkle feed
-        run: |
-          if git diff --quiet -- appcast.xml; then
-            echo "appcast.xml unchanged; skipping feed publish"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add appcast.xml
-          git commit -m "chore(appcast): add ${KIMI_VERSION} to Sparkle feed"
-          git fetch origin master
-          git rebase origin/master
-          git push origin HEAD:master
-
+      # Publish the GitHub release BEFORE the Sparkle feed: appcast.xml points
+      # at release-asset download URLs, and Sparkle clients poll master's raw
+      # feed continuously. Publishing the feed first left a window where an
+      # already-installed client could see the new version and 404 trying to
+      # download an asset that didn't exist yet.
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -213,3 +235,21 @@ jobs:
             --title "Kimi Code Agent $VERSION" \
             --generate-notes \
             $EXTRA
+
+      # The packaging script prepends this release to appcast.xml; publish it
+      # back to master because SUFeedURL reads the feed from master's raw URL.
+      # By this point the GitHub release assets above already exist, so any
+      # Sparkle client that sees the updated feed can download immediately.
+      - name: Publish updated Sparkle feed
+        run: |
+          if git diff --quiet -- appcast.xml; then
+            echo "appcast.xml unchanged; skipping feed publish"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add appcast.xml
+          git commit -m "chore(appcast): add ${KIMI_VERSION} to Sparkle feed"
+          git fetch origin master
+          git rebase origin/master
+          git push origin HEAD:master

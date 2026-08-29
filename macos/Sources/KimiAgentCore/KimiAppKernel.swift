@@ -1024,6 +1024,23 @@ public actor KimiAppKernel {
     return KimiIntegrationStatus(mcpServers: mcp, skills: skills)
   }
 
+  /// Adds an MCP server to the running engine via its live `POST /mcp`
+  /// endpoint — the server connects immediately, no engine restart required.
+  /// This is a runtime-only addition: it does not persist the entry, so it
+  /// won't survive the next engine relaunch unless the caller also writes it
+  /// to the on-disk MCP server config that `KimiHeadlessRuntimeFactory`
+  /// reads at startup.
+  public func addMCPServerAtRuntime(_ entry: KimiMCPServerEntry) async throws {
+    try await sessionClient.addMCPServer(entry, directory: nil)
+  }
+
+  /// Disconnects an MCP server from the running engine via its live
+  /// `POST /mcp/{name}/disconnect` endpoint — no engine restart required.
+  /// Same persistence caveat as `addMCPServerAtRuntime`.
+  public func removeMCPServerAtRuntime(name: String) async throws {
+    try await sessionClient.removeMCPServer(name: name, directory: nil)
+  }
+
   /// The Harness intent/receipt journal joined into per-effect rows, newest
   /// first, for the verification panel.
   public func loadVerificationRecords() async -> [KimiVerificationRecord] {

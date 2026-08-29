@@ -350,6 +350,20 @@ final class HistoryScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked
 /// Streams one tool call and its result so verification-record joins have a
 /// settled receipt to project.
 final class VerifyScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+  private let lock = NSLock()
+  private var _addedMCPServers: [KimiMCPServerEntry] = []
+  private var _removedMCPServerNames: [String] = []
+
+  var addedMCPServers: [KimiMCPServerEntry] {
+    lock.lock(); defer { lock.unlock() }
+    return _addedMCPServers
+  }
+
+  var removedMCPServerNames: [String] {
+    lock.lock(); defer { lock.unlock() }
+    return _removedMCPServerNames
+  }
+
   func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
     KimiRuntimeSession(id: "verify-session", title: "验证", directory: input.directory)
   }
@@ -359,6 +373,14 @@ final class VerifyScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked 
   func abort(sessionID: String, directory: String?) async throws {}
   func respondPermission(_ input: PermissionResponse) async throws {}
   func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func addMCPServer(_ entry: KimiMCPServerEntry, directory: String?) async throws {
+    lock.withLock { _addedMCPServers.append(entry) }
+  }
+
+  func removeMCPServer(name: String, directory: String?) async throws {
+    lock.withLock { _removedMCPServerNames.append(name) }
+  }
 
   func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
     AsyncThrowingStream { continuation in
@@ -3739,6 +3761,22 @@ let mcpPanelStatuses = try! awaitValue { try await mockClient.fetchMcpStatus(dir
 expect(mcpPanelStatuses.count == 2 && mcpPanelStatuses.first(where: { $0.name == "broken" })?.detail == "exit 1", "MCP 状态必须解析 name/status/error")
 let skillSummaries = try! awaitValue { try await mockClient.fetchSkills(directory: nil) }
 expect(skillSummaries.count == 2 && skillSummaries.first?.name == "code-review", "Skills 列表必须解析 name/description")
+
+// MCP 动态添加/移除通道：POST /mcp 和 POST /mcp/{name}/disconnect
+let dynamicMcpEntry = KimiMCPServerEntry(id: "filesystem", transport: .local, enabled: true, command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"], environment: ["API_KEY": "secret"])
+_ = try! awaitValue { try await mockClient.addMCPServer(dynamicMcpEntry, directory: nil); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /mcp") && $0.contains("\"name\":\"filesystem\"") }), "动态添加 MCP 服务器必须调用 POST /mcp 并携带 name 字段")
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /mcp") && $0.contains("\"type\":\"local\"") && $0.contains("\"command\"") }), "动态添加 MCP 服务器的 config 必须携带引擎 schema 的 type/command 字段（不是 cmd/stdio）")
+_ = try! awaitValue { try await mockClient.removeMCPServer(name: "filesystem", directory: nil); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /mcp/filesystem/disconnect") }), "动态移除 MCP 服务器必须调用 POST /mcp/{name}/disconnect")
+
+// KimiAppKernel 的公开包装方法必须原样转发给 sessionClient，不吞掉错误
+let mcpKernelClient = VerifyScriptKimiRuntimeClient()
+let mcpKernel = KimiAppKernel(sessionClient: mcpKernelClient)
+try! awaitValue { try await mcpKernel.addMCPServerAtRuntime(dynamicMcpEntry); return () }
+expect(mcpKernelClient.addedMCPServers.contains(where: { $0.id == "filesystem" }), "KimiAppKernel.addMCPServerAtRuntime 必须把服务器条目转发给 sessionClient")
+try! awaitValue { try await mcpKernel.removeMCPServerAtRuntime(name: "filesystem"); return () }
+expect(mcpKernelClient.removedMCPServerNames.contains("filesystem"), "KimiAppKernel.removeMCPServerAtRuntime 必须把服务器名转发给 sessionClient")
 
 let verifyClient = VerifyScriptKimiRuntimeClient()
 let verifyKernel = KimiAppKernel(sessionClient: verifyClient)
