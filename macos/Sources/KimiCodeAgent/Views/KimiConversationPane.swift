@@ -138,7 +138,14 @@ struct KimiConversationPane: View {
             ForEach(timeline) { item in
               switch item {
               case let .message(message):
-                KimiMessageRow(message: message)
+                KimiMessageRow(
+                  message: message,
+                  onFork: message.runtimeMessageID != nil ? {
+                    if let activeID = model.state.activeSessionID {
+                      model.forkSession(activeID, messageID: message.runtimeMessageID)
+                    }
+                  } : nil
+                )
                   .id(message.id)
               case let .activity(activity):
                 KimiActivityCard(activity: activity)
@@ -197,39 +204,51 @@ struct KimiConversationPane: View {
 
 struct KimiMessageRow: View {
   let message: KimiMessage
+  /// Nil when this message hasn't been durably recorded by the engine yet
+  /// (no runtimeMessageID to fork from) — the context menu item is omitted
+  /// in that case rather than shown disabled, since a message that just
+  /// streamed in usually gets one within moments of the turn finishing.
+  var onFork: (() -> Void)? = nil
 
   var body: some View {
-    if message.role == .user {
-      // User message: gray rounded pill, right-aligned like Claude Code
-      HStack {
-        Spacer(minLength: 40)
-        Text(message.text)
+    Group {
+      if message.role == .user {
+        // User message: gray rounded pill, right-aligned like Claude Code
+        HStack {
+          Spacer(minLength: 40)
+          Text(message.text)
+            .font(.body)
+            .textSelection(.enabled)
+            .multilineTextAlignment(.leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(KimiDesign.surfaceSecondary)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+        }
+      } else {
+        // Assistant message: no card background, icon + text
+        HStack(alignment: .top, spacing: 10) {
+          Image(systemName: "sparkles")
+            .font(.caption)
+            .foregroundStyle(KimiDesign.primary)
+            .frame(width: 16, height: 20)
+            .padding(.top, 2)
+          Group {
+            if let attributed = try? AttributedString(markdown: message.text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+              Text(attributed)
+            } else {
+              Text(message.text)
+            }
+          }
           .font(.body)
           .textSelection(.enabled)
-          .multilineTextAlignment(.leading)
-          .padding(.horizontal, 14)
-          .padding(.vertical, 10)
-          .background(KimiDesign.surfaceSecondary)
-          .clipShape(RoundedRectangle(cornerRadius: 14))
-      }
-    } else {
-      // Assistant message: no card background, icon + text
-      HStack(alignment: .top, spacing: 10) {
-        Image(systemName: "sparkles")
-          .font(.caption)
-          .foregroundStyle(KimiDesign.primary)
-          .frame(width: 16, height: 20)
-          .padding(.top, 2)
-        Group {
-          if let attributed = try? AttributedString(markdown: message.text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-            Text(attributed)
-          } else {
-            Text(message.text)
-          }
+          .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .font(.body)
-        .textSelection(.enabled)
-        .frame(maxWidth: .infinity, alignment: .leading)
+      }
+    }
+    .contextMenu {
+      if let onFork {
+        Button("从此消息分支会话", action: onFork)
       }
     }
   }

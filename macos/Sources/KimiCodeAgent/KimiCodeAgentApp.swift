@@ -296,6 +296,16 @@ final class KimiAppViewModel: ObservableObject {
     }
   }
 
+  /// Forks a session into a new branch. `messageID` is the engine message ID
+  /// to branch from (nil forks the entire history up to now). The new
+  /// session becomes active immediately, same as creating a fresh one.
+  func forkSession(_ id: UUID, messageID: String?) {
+    Task {
+      try? await kernel.send(.forkSession(id, messageID: messageID))
+      await refresh()
+    }
+  }
+
   func sendPrompt() {
     let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty else { return }

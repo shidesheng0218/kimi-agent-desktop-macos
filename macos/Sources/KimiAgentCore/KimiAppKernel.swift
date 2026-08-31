@@ -281,6 +281,30 @@ public actor KimiAppKernel {
       try await watch(sessionID: session.id)
       publish(.sessionChanged(summary))
 
+    case let .forkSession(id, messageID):
+      guard let source = state.sessions.first(where: { $0.id == id }), let sourceRuntimeID = source.runtimeID else {
+        throw KimiRuntimeError.notRunning
+      }
+      let forked = try await sessionClient.forkSession(sessionID: sourceRuntimeID, messageID: messageID, directory: source.projectPath)
+      let summary = KimiSessionSummary(
+        id: UUID(),
+        runtimeID: forked.id,
+        title: forked.title ?? "\(source.title) 分支",
+        projectPath: forked.directory ?? source.projectPath,
+        parentRuntimeID: forked.parentID ?? sourceRuntimeID
+      )
+      state.sessions.insert(summary, at: 0)
+      state.activeSessionID = summary.id
+      state.messages.removeAll()
+      state.activities.removeAll()
+      state.todos.removeAll()
+      state.todosSessionID = nil
+      recordRecentProject(summary.projectPath)
+      await activityStats?.record(KimiActivityRecord(kind: .sessionCreated, project: summary.projectPath))
+      try await watch(sessionID: forked.id)
+      await loadHistory(sessionID: forked.id)
+      publish(.sessionChanged(summary))
+
     case let .selectSession(id):
       guard state.sessions.contains(where: { $0.id == id }) else { return }
       state.activeSessionID = id
@@ -545,7 +569,7 @@ public actor KimiAppKernel {
       if message.role == "user" {
         let text = message.parts.filter { $0.type == "text" }.compactMap(\.text).joined(separator: "\n")
         if !text.isEmpty {
-          messages.append(KimiMessage(role: .user, text: text, createdAt: createdAt))
+          messages.append(KimiMessage(role: .user, text: text, runtimeMessageID: message.id, createdAt: createdAt))
         }
         continue
       }
@@ -553,7 +577,7 @@ public actor KimiAppKernel {
         switch part.type {
         case "text":
           if let text = part.text, !text.isEmpty {
-            messages.append(KimiMessage(role: .assistant, text: text, runtimePartID: part.partID, createdAt: createdAt))
+            messages.append(KimiMessage(role: .assistant, text: text, runtimePartID: part.partID, runtimeMessageID: message.id, createdAt: createdAt))
           }
         case "tool":
           let failed = part.status == "failed" || part.status == "error"

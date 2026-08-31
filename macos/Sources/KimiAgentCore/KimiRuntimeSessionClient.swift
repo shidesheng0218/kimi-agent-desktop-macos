@@ -4,21 +4,31 @@ public struct KimiRuntimeSession: Codable, Equatable, Identifiable, Sendable {
   public let id: String
   public var title: String?
   public var directory: String?
+  /// The engine-side session ID this one was forked from (via POST
+  /// /session/:id/fork or by passing parentID at creation), or nil for a
+  /// root session. Mirrors the engine's session Info.parentID field.
+  public var parentID: String?
 
-  public init(id: String, title: String? = nil, directory: String? = nil) {
+  public init(id: String, title: String? = nil, directory: String? = nil, parentID: String? = nil) {
     self.id = id
     self.title = title
     self.directory = directory
+    self.parentID = parentID
   }
 }
 
 public struct CreateSessionInput: Codable, Sendable {
   public let directory: String?
   public let title: String?
+  /// When set, the engine creates this session as a child of the given
+  /// session ID (same effect as forking with no messageID — full history
+  /// carried over). Most callers leave this nil for a fresh root session.
+  public let parentID: String?
 
-  public init(directory: String? = nil, title: String? = nil) {
+  public init(directory: String? = nil, title: String? = nil, parentID: String? = nil) {
     self.directory = directory
     self.title = title
+    self.parentID = parentID
   }
 }
 
@@ -107,6 +117,10 @@ public struct KimiRuntimeHistoryMessage: Sendable, Equatable {
 
 public protocol KimiRuntimeSessionClient: Sendable {
   func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession
+  /// Forks a session via POST /session/:sessionID/fork. Passing messageID
+  /// branches from that specific message; nil forks the entire history up to
+  /// the current point. The returned session's parentID is set by the engine.
+  func forkSession(sessionID: String, messageID: String?, directory: String?) async throws -> KimiRuntimeSession
   func prompt(_ input: KimiRuntimePromptInput) async throws
   func steer(_ input: KimiRuntimeSteerInput) async throws
   func abort(sessionID: String, directory: String?) async throws
@@ -138,6 +152,7 @@ public protocol KimiRuntimeSessionClient: Sendable {
 /// Convenience defaults keep scripted clients in checks and smoke targets
 /// minimal; the production URLSession client provides real implementations.
 public extension KimiRuntimeSessionClient {
+  func forkSession(sessionID: String, messageID: String?, directory: String?) async throws -> KimiRuntimeSession { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   func fetchMessages(sessionID: String, directory: String?) async throws -> [KimiRuntimeHistoryMessage] { [] }
   func fetchModelCatalog(directory: String?) async throws -> [String] { [] }
   func fetchTodos(sessionID: String, directory: String?) async throws -> [KimiTodoItem] { [] }
@@ -173,10 +188,22 @@ public final class URLSessionRuntimeClient: KimiRuntimeSessionClient, @unchecked
     // engine process's cwd instead of the chosen project.
     var body: [String: Any] = [:]
     if let title = input.title { body["title"] = title }
+    if let parentID = input.parentID { body["parentID"] = parentID }
     return try await request(
       path: "/session",
       method: "POST",
       query: directoryQuery(input.directory),
+      body: body
+    )
+  }
+
+  public func forkSession(sessionID: String, messageID: String?, directory: String?) async throws -> KimiRuntimeSession {
+    var body: [String: Any] = [:]
+    if let messageID { body["messageID"] = messageID }
+    return try await request(
+      path: "/session/\(sessionID)/fork",
+      method: "POST",
+      query: directoryQuery(directory),
       body: body
     )
   }

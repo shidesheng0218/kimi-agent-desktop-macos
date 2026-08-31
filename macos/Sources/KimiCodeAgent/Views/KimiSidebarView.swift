@@ -67,12 +67,17 @@ struct KimiSidebarView: View {
               Image(systemName: "folder").font(.caption2)
               Text(group.name).font(.caption.weight(.semibold)).lineLimit(1)
               Spacer()
-              Text("\(group.sessions.count)").font(.caption2)
+              Text("\(group.sessionCount)").font(.caption2)
             }
             .foregroundStyle(KimiDesign.muted)
             .padding(.horizontal, 4)
-            ForEach(group.sessions) { session in
-              sessionRow(session)
+            // Root sessions render at top level; forked sessions nest under
+            // their parent via OutlineGroup so the sidebar reads as a branch
+            // tree instead of a flat, chronologically-sorted list.
+            ForEach(group.roots) { node in
+              OutlineGroup(node, children: \.children) { node in
+                sessionRow(node.session)
+              }
             }
           }
         }
@@ -90,6 +95,11 @@ struct KimiSidebarView: View {
   private func sessionRow(_ session: KimiSessionSummary) -> some View {
     Button { model.select(session.id) } label: {
       HStack(spacing: 8) {
+        if session.parentRuntimeID != nil {
+          Image(systemName: "arrow.triangle.branch")
+            .font(.caption2)
+            .foregroundStyle(KimiDesign.muted)
+        }
         Circle()
           .fill(KimiDesign.statusColor(session.status))
           .frame(width: 7, height: 7)
@@ -112,6 +122,9 @@ struct KimiSidebarView: View {
       .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
+    .contextMenu {
+      Button("从此会话分支") { model.forkSession(session.id, messageID: nil) }
+    }
   }
 
   private var footer: some View {
@@ -147,10 +160,27 @@ struct KimiSidebarView: View {
     }
   }
 
+  /// A session and its forked children, for OutlineGroup's tree rendering.
+  /// Reference type because OutlineGroup needs stable identity across a
+  /// recursive `children` keypath; a value-type struct would need indirect
+  /// enum boxing for the same recursive shape.
+  private final class SessionNode: Identifiable {
+    let session: KimiSessionSummary
+    var children: [SessionNode]?
+
+    init(session: KimiSessionSummary, children: [SessionNode]? = nil) {
+      self.session = session
+      self.children = children
+    }
+
+    var id: UUID { session.id }
+  }
+
   private struct SessionGroup {
     let project: String
     let name: String
-    let sessions: [KimiSessionSummary]
+    let sessionCount: Int
+    let roots: [SessionNode]
   }
 
   private var groupedSessions: [SessionGroup] {
@@ -159,12 +189,52 @@ struct KimiSidebarView: View {
       SessionGroup(
         project: path.isEmpty ? "ungrouped" : path,
         name: path.isEmpty ? "未分组" : URL(fileURLWithPath: path).lastPathComponent,
-        sessions: sessions.sorted { $0.updatedAt > $1.updatedAt }
+        sessionCount: sessions.count,
+        roots: Self.buildTree(from: sessions)
       )
     }
     .sorted {
-      ($0.sessions.first?.updatedAt ?? .distantPast) > ($1.sessions.first?.updatedAt ?? .distantPast)
+      (mostRecentUpdate(in: $0.roots) ?? .distantPast) > (mostRecentUpdate(in: $1.roots) ?? .distantPast)
     }
+  }
+
+  /// Builds a forest from a flat session list using parentRuntimeID. A
+  /// session whose parent isn't present in this same list (parent lives in a
+  /// different project group, or the parent was deleted) renders as its own
+  /// root rather than being dropped — every session must stay reachable.
+  private static func buildTree(from sessions: [KimiSessionSummary]) -> [SessionNode] {
+    var nodesByRuntimeID: [String: SessionNode] = [:]
+    for session in sessions {
+      nodesByRuntimeID[session.runtimeID ?? session.id.uuidString] = SessionNode(session: session)
+    }
+    var roots: [SessionNode] = []
+    for session in sessions {
+      let node = nodesByRuntimeID[session.runtimeID ?? session.id.uuidString]!
+      if let parentRuntimeID = session.parentRuntimeID, let parent = nodesByRuntimeID[parentRuntimeID] {
+        parent.children = (parent.children ?? []) + [node]
+      } else {
+        roots.append(node)
+      }
+    }
+    // Sort every level (roots and each parent's children) newest first, so
+    // branch trees read the same top-to-bottom order as the old flat list.
+    func sortRecursively(_ nodes: [SessionNode]) -> [SessionNode] {
+      let sorted = nodes.sorted { $0.session.updatedAt > $1.session.updatedAt }
+      for node in sorted {
+        if let children = node.children {
+          node.children = sortRecursively(children)
+        }
+      }
+      return sorted
+    }
+    return sortRecursively(roots)
+  }
+
+  private func mostRecentUpdate(in nodes: [SessionNode]) -> Date? {
+    nodes.map { node -> Date in
+      let childMax = node.children.flatMap(mostRecentUpdate) ?? .distantPast
+      return max(node.session.updatedAt, childMax)
+    }.max()
   }
 
   private var userName: String {

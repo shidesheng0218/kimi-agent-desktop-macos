@@ -4,6 +4,9 @@ import Foundation
 /// distinct name from the legacy `KimiCommand` process-launch value type.
 public enum KimiAppCommand: Sendable, Equatable {
   case createSession(directory: String?)
+  /// Forks the given session into a new branch. `messageID` is the engine
+  /// message ID to branch from; nil forks the entire history up to now.
+  case forkSession(UUID, messageID: String?)
   case selectSession(UUID)
   case showHome
   case prompt(PromptInput)
@@ -31,6 +34,7 @@ public enum KimiAppCommand: Sendable, Equatable {
 
   public enum Kind: String, Codable, Sendable {
     case createSession
+    case forkSession
     case selectSession
     case showHome
     case prompt
@@ -60,6 +64,7 @@ public enum KimiAppCommand: Sendable, Equatable {
   public var kind: Kind {
     switch self {
     case .createSession: .createSession
+    case .forkSession: .forkSession
     case .selectSession: .selectSession
     case .showHome: .showHome
     case .prompt: .prompt
@@ -119,6 +124,11 @@ public struct KimiSessionSummary: Codable, Equatable, Identifiable, Sendable {
   public var projectPath: String?
   public var status: SessionStatus
   public var updatedAt: Date
+  /// The engine-side `ses_...` ID of the session this one was forked from, or
+  /// nil for a root session. Mirrors the engine's `parentID` field (see
+  /// `KimiRuntimeSession.parentID`) so the sidebar can render a branch tree
+  /// without a second round trip.
+  public var parentRuntimeID: String?
 
   public init(
     id: UUID = UUID(),
@@ -126,7 +136,8 @@ public struct KimiSessionSummary: Codable, Equatable, Identifiable, Sendable {
     title: String = "新会话",
     projectPath: String? = nil,
     status: SessionStatus = .idle,
-    updatedAt: Date = .now
+    updatedAt: Date = .now,
+    parentRuntimeID: String? = nil
   ) {
     self.id = id
     self.runtimeID = runtimeID
@@ -134,6 +145,7 @@ public struct KimiSessionSummary: Codable, Equatable, Identifiable, Sendable {
     self.projectPath = projectPath
     self.status = status
     self.updatedAt = updatedAt
+    self.parentRuntimeID = parentRuntimeID
   }
 }
 
@@ -153,6 +165,14 @@ public struct KimiMessage: Codable, Equatable, Identifiable, Sendable {
   /// streaming text part maps to exactly one bubble, so deltas append to and
   /// snapshots replace the same row instead of shattering into fragments.
   public let runtimePartID: String?
+  /// Engine-side message identifier (the `id` field on GET
+  /// /session/:id/message rows, i.e. `msg_...`). Live-appended messages
+  /// (the ones constructed as the user types or the assistant streams) don't
+  /// have this yet — it's only known once the engine has durably recorded
+  /// the message and `loadHistory` rebuilds the timeline from
+  /// `fetchMessages`. Needed to fork a session from a specific message via
+  /// POST /session/:id/fork, which takes an engine messageID.
+  public let runtimeMessageID: String?
   public let createdAt: Date
 
   public init(
@@ -161,6 +181,7 @@ public struct KimiMessage: Codable, Equatable, Identifiable, Sendable {
     text: String,
     isStreaming: Bool = false,
     runtimePartID: String? = nil,
+    runtimeMessageID: String? = nil,
     createdAt: Date = .now
   ) {
     self.id = id
@@ -168,6 +189,7 @@ public struct KimiMessage: Codable, Equatable, Identifiable, Sendable {
     self.text = text
     self.isStreaming = isStreaming
     self.runtimePartID = runtimePartID
+    self.runtimeMessageID = runtimeMessageID
     self.createdAt = createdAt
   }
 }

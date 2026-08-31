@@ -364,8 +364,18 @@ final class VerifyScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked 
     return _removedMCPServerNames
   }
 
+  private var _forkCounter = 0
+
   func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
-    KimiRuntimeSession(id: "verify-session", title: "验证", directory: input.directory)
+    KimiRuntimeSession(id: "verify-session", title: "验证", directory: input.directory, parentID: input.parentID)
+  }
+
+  func forkSession(sessionID: String, messageID: String?, directory: String?) async throws -> KimiRuntimeSession {
+    let forkIndex: Int = lock.withLock {
+      _forkCounter += 1
+      return _forkCounter
+    }
+    return KimiRuntimeSession(id: "verify-session-fork-\(forkIndex)", title: "验证 分支", directory: directory, parentID: sessionID)
   }
 
   func prompt(_ input: KimiRuntimePromptInput) async throws {}
@@ -3552,6 +3562,8 @@ MockURLProtocol.requestHandler = { request in
   switch path {
   case "/session":
     body = Data("{\"id\":\"session-1\",\"title\":\"测试会话\"}".utf8)
+  case "/session/session-1/fork":
+    body = Data("{\"id\":\"session-fork-1\",\"title\":\"测试会话 分支\",\"parentID\":\"session-1\"}".utf8)
   case "/session/session-1/message":
     body = Data(#"[{"info":{"id":"msg-u1","role":"user","time":{"created":1787000000000}},"parts":[{"id":"p-u1","type":"text","text":"历史问题"}]},{"info":{"id":"msg-a1","role":"assistant","time":{"created":1787000001000}},"parts":[{"id":"p-a1","type":"text","text":"历史回答"},{"id":"p-t1","type":"tool","tool":"read","callID":"call-h1","state":{"status":"completed","output":"文件内容"}}]}]"#.utf8)
   case "/provider":
@@ -3583,6 +3595,28 @@ expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session?
 _ = try! awaitValue { try await mockClient.prompt(KimiRuntimePromptInput(sessionID: "session-1", text: "带目录", directory: "/tmp/kimi proj&x")); return () }
 expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/prompt_async?directory=") }), "Engine Prompt 必须按会话目录路由 query 参数")
 expect(bridgedPermission?.patterns == ["npm test"], "Permission Card 必须保留引擎下发的 patterns 列表")
+
+// 会话分支：POST /session/{id}/fork，会话创建可携带 parentID
+let forkedSession = try! awaitValue { try await mockClient.forkSession(sessionID: "session-1", messageID: "msg-u1", directory: nil) }
+expect(forkedSession.id == "session-fork-1" && forkedSession.parentID == "session-1", "forkSession 必须解析新会话的 id 与 parentID")
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/fork") && $0.contains("\"messageID\":\"msg-u1\"") }), "分支会话必须调用 POST /session/{id}/fork 并携带目标消息 ID")
+_ = try! awaitValue { try await mockClient.forkSession(sessionID: "session-1", messageID: nil, directory: nil) }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/fork {}") }), "不指定 messageID 时分支必须携带空 body（分支全部历史）")
+_ = try! awaitValue { try await mockClient.createSession(CreateSessionInput(title: "子会话", parentID: "session-1")); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session") && $0.contains("\"parentID\":\"session-1\"") }), "创建会话时必须能携带 parentID 直接建立分支关系")
+
+// KimiAppKernel.forkSession 的端到端行为：分支后的新会话必须携带 parentRuntimeID 并成为激活会话
+let forkKernelClient = VerifyScriptKimiRuntimeClient()
+let forkKernel = KimiAppKernel(sessionClient: forkKernelClient)
+try! awaitValue { try await forkKernel.send(.createSession(directory: "/tmp/fork-root")); return () }
+let forkKernelSnapshotBefore = await forkKernel.snapshot()
+let rootSessionID = forkKernelSnapshotBefore.activeSessionID
+expect(rootSessionID != nil, "创建根会话后 activeSessionID 必须存在")
+try! awaitValue { try await forkKernel.send(.forkSession(rootSessionID ?? UUID(), messageID: nil)); return () }
+let forkKernelSnapshotAfter = await forkKernel.snapshot()
+expect(forkKernelSnapshotAfter.activeSessionID != rootSessionID, "分支后必须切换到新创建的分支会话")
+let forkedSummary = forkKernelSnapshotAfter.sessions.first { $0.id == forkKernelSnapshotAfter.activeSessionID }
+expect(forkedSummary?.parentRuntimeID != nil, "分支会话摘要必须携带 parentRuntimeID，供侧栏渲染分支树")
 
 // P0 流式解码：part 类型注册 → delta 分类 → 快照/增量语义
 let p0Decoder = KimiRuntimeEventDecoder()
