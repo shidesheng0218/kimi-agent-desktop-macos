@@ -10,7 +10,7 @@
 
 <p>
   <img src="https://img.shields.io/badge/platform-macOS%2014%2B-111827?style=flat-square" alt="macOS 14+">
-  <img src="https://img.shields.io/badge/runtime-SwiftUI%20%2B%20Headless%20Engine-0f766e?style=flat-square" alt="Kimi SwiftUI and OpenCode Headless">
+  <img src="https://img.shields.io/badge/runtime-SwiftUI%20%2B%20Headless%20Engine-0f766e?style=flat-square" alt="Kimi SwiftUI and Headless Engine">
   <img src="https://img.shields.io/badge/model-Kimi%20API%20%7C%20Kimi%20Code-2563eb?style=flat-square" alt="Kimi API and Kimi Code">
   <img src="https://img.shields.io/badge/distribution-GitHub%20Releases-181717?style=flat-square&logo=github" alt="GitHub Releases">
 </p>
@@ -75,7 +75,7 @@ flowchart LR
     B --> MAC[WKWebView / Computer Use / WebRuntime]
 ```
 
-- 内置引擎（opencode 派生）是唯一执行链：会话循环、工具注册、权限判定、压缩与子代理都在引擎内完成；
+- 内置执行内核是唯一执行链：会话循环、工具注册、权限判定、压缩与子代理都在引擎内完成；
 - Swift 侧 Harness 对每次工具调用事后补记 Intent/Receipt（含输入输出 sha256 摘要），用于审计、统计与崩溃恢复，绝不伪造成功回执；
 - 需要联网、浏览器验证或系统级操作的工具由引擎插件转发给一次性 `KimiNativeBridge` 进程，桥端再做一次 URL/审批校验；
 - 主对话只展示结论、证据和下一步；工具原始 JSON、终端长输出和内部推理进入可折叠 Activity Card，不污染聊天内容。
@@ -195,7 +195,7 @@ Kimi API 是默认模型入口。ACP / CLI 只产生模型事件，作为兼容�
 ```text
 .
 ├── vendor/engine/                 # 内置执行内核源码（MIT，见 THIRD_PARTY_NOTICES）
-│   ├── packages/opencode/            # Session、Tool、Permission、MCP、Skills、Hooks
+│   ├── packages/*/                   # Session、Tool、Permission、MCP、Skills、Hooks
 │   ├── packages/desktop/             # 桌面参考源码，不进入生产包
 │   └── packages/kimi-code-agent-plugin/
 │                                     # Kimi Web / Browser / Computer Use 原生工具
