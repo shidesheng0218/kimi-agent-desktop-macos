@@ -13,23 +13,10 @@ let package = Package(
     .executable(name: "RestartRecoveryCheck", targets: ["RestartRecoveryCheck"])
   ],
   dependencies: [
-    .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.5.0"),
-    .package(url: "https://github.com/apple/swift-openapi-generator", from: "1.0.0"),
-    .package(url: "https://github.com/apple/swift-openapi-runtime", from: "1.0.0"),
-    .package(url: "https://github.com/apple/swift-openapi-urlsession", from: "1.0.0")
+    .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.5.0")
   ],
   targets: [
-    .target(
-      name: "EngineAPIClient",
-      dependencies: [
-        .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
-        .product(name: "OpenAPIURLSession", package: "swift-openapi-urlsession")
-      ],
-      plugins: [
-        .plugin(name: "OpenAPIGenerator", package: "swift-openapi-generator")
-      ]
-    ),
-    .target(name: "KimiAgentCore", dependencies: ["EngineAPIClient"]),
+    .target(name: "KimiAgentCore", dependencies: []),
     .executableTarget(
       name: "KimiCodeAgent",
       dependencies: [
