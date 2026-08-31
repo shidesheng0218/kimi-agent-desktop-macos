@@ -198,6 +198,17 @@ final class KimiAppViewModel: ObservableObject {
     }
   }
 
+  /// Skips the folder picker: the session binds to the app's private
+  /// scratch directory instead of a user-chosen project. See
+  /// KimiAppKernel.resolveScratchDirectory for why this is never a truly
+  /// directory-less session.
+  func createScratchSession() {
+    Task {
+      try? await kernel.send(.createScratchSession)
+      await refresh()
+    }
+  }
+
   /// All session creation funnels through a project picker: the engine
   /// resolves the working directory per session, so a session without a
   /// project would silently run in the engine's cwd instead of user code.

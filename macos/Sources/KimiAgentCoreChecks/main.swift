@@ -3618,6 +3618,22 @@ expect(forkKernelSnapshotAfter.activeSessionID != rootSessionID, "分支后必�
 let forkedSummary = forkKernelSnapshotAfter.sessions.first { $0.id == forkKernelSnapshotAfter.activeSessionID }
 expect(forkedSummary?.parentRuntimeID != nil, "分支会话摘要必须携带 parentRuntimeID，供侧栏渲染分支树")
 
+// 临时对话：始终携带真实目录（应用私有 scratch 目录），绝不省略 directory 参数
+// —— 引擎收到空 directory 会静默 fallback 到自己进程的 cwd，工具会在错误的地方
+// 读写文件且不报错，这是本方案要规避的核心风险。
+let scratchClient = URLSessionRuntimeClient(
+  endpoint: KimiRuntimeEndpoint(port: 43210, token: "test"),
+  session: URLSession(configuration: mockConfiguration)
+)
+let scratchKernel = KimiAppKernel(sessionClient: scratchClient)
+try! awaitValue { try await scratchKernel.send(.createScratchSession); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session?directory=") && $0.contains("scratch") }), "创建临时对话必须携带非空 directory query 参数，且指向应用私有 scratch 目录")
+let scratchSnapshot = await scratchKernel.snapshot()
+let scratchSummary = scratchSnapshot.sessions.first { $0.id == scratchSnapshot.activeSessionID }
+expect(scratchSummary?.isScratch == true, "临时对话的会话摘要必须标记 isScratch，供侧栏和会话头部识别")
+expect(scratchSummary?.projectPath?.contains("scratch") == true, "临时对话必须绑定应用私有 scratch 目录，不是空目录")
+expect(scratchSnapshot.recentProjects.contains(where: { $0.contains("scratch") }) == false, "创建临时对话不能把 scratch 目录写入最近项目列表，否则会污染项目文件夹选择面板的默认建议")
+
 // P0 流式解码：part 类型注册 → delta 分类 → 快照/增量语义
 let p0Decoder = KimiRuntimeEventDecoder()
 _ = p0Decoder.decode(Data(#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"part-r1","messageID":"m1","type":"reasoning","text":"思考"}}}"#.utf8), sessionID: "s1")

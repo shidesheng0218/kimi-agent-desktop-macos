@@ -81,11 +81,23 @@ struct KimiConversationPane: View {
           Text(activeSession?.title ?? "会话")
             .font(.title3.weight(.semibold))
             .lineLimit(1)
-          Text(activeSession?.projectPath ?? "把想法变成可验证的代码")
-            .font(.caption)
-            .foregroundStyle(KimiDesign.muted)
-            .lineLimit(1)
-            .truncationMode(.middle)
+          // Scratch sessions bind to the app's private sandbox directory,
+          // not a project the user picked — showing that internal path here
+          // would look like a real project binding (the exact "Playground"
+          // confusion Codex Desktop's users reported). Say what it actually
+          // is instead.
+          if activeSession?.isScratch == true {
+            Text("临时对话 · 不绑定项目文件夹")
+              .font(.caption)
+              .foregroundStyle(KimiDesign.muted)
+              .lineLimit(1)
+          } else {
+            Text(activeSession?.projectPath ?? "把想法变成可验证的代码")
+              .font(.caption)
+              .foregroundStyle(KimiDesign.muted)
+              .lineLimit(1)
+              .truncationMode(.middle)
+          }
         }
         Spacer()
         if model.isActiveSessionBusy {

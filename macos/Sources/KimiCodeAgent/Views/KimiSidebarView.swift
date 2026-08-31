@@ -36,12 +36,25 @@ struct KimiSidebarView: View {
   }
 
   private var newSessionButton: some View {
-    Button(action: model.createSession) {
-      Label("新建会话", systemImage: "plus")
-        .frame(maxWidth: .infinity, alignment: .leading)
+    HStack(spacing: 6) {
+      Button(action: model.createSession) {
+        Label("新建会话", systemImage: "plus")
+          .frame(maxWidth: .infinity, alignment: .leading)
+      }
+      .buttonStyle(.borderedProminent)
+      .tint(KimiDesign.primary)
+
+      // Skips the folder picker entirely — bound to the app's private
+      // scratch directory (see KimiAppKernel.resolveScratchDirectory), never
+      // a truly directory-less session. Kept visually secondary (bordered,
+      // not prominent) so it doesn't compete with the primary "new session"
+      // action that most users want.
+      Button(action: model.createScratchSession) {
+        Image(systemName: "bubble.left.and.bubble.right")
+      }
+      .buttonStyle(.bordered)
+      .help("新建临时对话，不绑定项目文件夹")
     }
-    .buttonStyle(.borderedProminent)
-    .tint(KimiDesign.primary)
   }
 
   private var homeButton: some View {
@@ -64,7 +77,7 @@ struct KimiSidebarView: View {
         ForEach(groupedSessions, id: \.project) { group in
           VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
-              Image(systemName: "folder").font(.caption2)
+              Image(systemName: group.isScratchGroup ? "bubble.left.and.bubble.right" : "folder").font(.caption2)
               Text(group.name).font(.caption.weight(.semibold)).lineLimit(1)
               Spacer()
               Text("\(group.sessionCount)").font(.caption2)
@@ -181,21 +194,42 @@ struct KimiSidebarView: View {
     let name: String
     let sessionCount: Int
     let roots: [SessionNode]
+    let isScratchGroup: Bool
   }
 
+  /// Sentinel project key for scratch sessions — kept distinct from the
+  /// `"ungrouped"` key (empty projectPath) so a deliberately directory-less
+  /// scratch session never gets visually conflated with the genuine edge
+  /// case of a project session that somehow lost its path.
+  private static let scratchGroupKey = "kimi-scratch"
+
   private var groupedSessions: [SessionGroup] {
-    let grouped = Dictionary(grouping: model.state.sessions) { $0.projectPath ?? "" }
-    return grouped.map { path, sessions in
-      SessionGroup(
-        project: path.isEmpty ? "ungrouped" : path,
-        name: path.isEmpty ? "未分组" : URL(fileURLWithPath: path).lastPathComponent,
+    let grouped = Dictionary(grouping: model.state.sessions) { session in
+      session.isScratch ? Self.scratchGroupKey : (session.projectPath ?? "")
+    }
+    let groups = grouped.map { key, sessions -> SessionGroup in
+      if key == Self.scratchGroupKey {
+        return SessionGroup(project: key, name: "临时对话", sessionCount: sessions.count, roots: Self.buildTree(from: sessions), isScratchGroup: true)
+      }
+      return SessionGroup(
+        project: key.isEmpty ? "ungrouped" : key,
+        name: key.isEmpty ? "未分组" : URL(fileURLWithPath: key).lastPathComponent,
         sessionCount: sessions.count,
-        roots: Self.buildTree(from: sessions)
+        roots: Self.buildTree(from: sessions),
+        isScratchGroup: false
       )
     }
-    .sorted {
+    // Scratch always sorts last, regardless of how recently it was used —
+    // it's a utility bucket, not a project, and shouldn't jostle for
+    // position above real project groups just because it's convenient to
+    // reach for.
+    let (scratchGroups, projectGroups) = groups.reduce(into: ([SessionGroup](), [SessionGroup]())) { acc, group in
+      if group.isScratchGroup { acc.0.append(group) } else { acc.1.append(group) }
+    }
+    let sortedProjectGroups = projectGroups.sorted {
       (mostRecentUpdate(in: $0.roots) ?? .distantPast) > (mostRecentUpdate(in: $1.roots) ?? .distantPast)
     }
+    return sortedProjectGroups + scratchGroups
   }
 
   /// Builds a forest from a flat session list using parentRuntimeID. A

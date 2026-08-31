@@ -281,6 +281,28 @@ public actor KimiAppKernel {
       try await watch(sessionID: session.id)
       publish(.sessionChanged(summary))
 
+    case .createScratchSession:
+      let scratchDirectory = try resolveScratchDirectory()
+      let session = try await sessionClient.createSession(CreateSessionInput(directory: scratchDirectory.path, title: "临时对话"))
+      let summary = KimiSessionSummary(
+        id: UUID(),
+        runtimeID: session.id,
+        title: session.title ?? "临时对话",
+        projectPath: session.directory ?? scratchDirectory.path,
+        isScratch: true
+      )
+      state.sessions.insert(summary, at: 0)
+      state.activeSessionID = summary.id
+      state.messages.removeAll()
+      state.activities.removeAll()
+      state.todos.removeAll()
+      state.todosSessionID = nil
+      // Deliberately no recordRecentProject: the scratch directory must
+      // never surface as a suggested folder for real project sessions.
+      await activityStats?.record(KimiActivityRecord(kind: .sessionCreated, project: summary.projectPath))
+      try await watch(sessionID: session.id)
+      publish(.sessionChanged(summary))
+
     case let .forkSession(id, messageID):
       guard let source = state.sessions.first(where: { $0.id == id }), let sourceRuntimeID = source.runtimeID else {
         throw KimiRuntimeError.notRunning
@@ -554,6 +576,19 @@ public actor KimiAppKernel {
     if state.recentProjects.count > 10 {
       state.recentProjects = Array(state.recentProjects.prefix(10))
     }
+  }
+
+  /// The app's private directory for scratch sessions — always a real path,
+  /// so the engine's `directory` query parameter is never omitted (an
+  /// omitted directory falls back to the engine process's own cwd, silently
+  /// running tools in the wrong place). Never surfaced in the folder picker
+  /// or `state.recentProjects`, so it can't be confused with a project the
+  /// user actually chose.
+  private func resolveScratchDirectory() throws -> URL {
+    let directory = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/Kimi Code Agent/scratch", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
   }
 
   /// Rebuilds the conversation from the engine's durable message log. The

@@ -4,6 +4,11 @@ import Foundation
 /// distinct name from the legacy `KimiCommand` process-launch value type.
 public enum KimiAppCommand: Sendable, Equatable {
   case createSession(directory: String?)
+  /// Creates a session bound to the app's private scratch directory instead
+  /// of a user-chosen project — no folder picker, no entry in recent
+  /// projects. Always has a real directory (never omitted from the engine
+  /// request), just one the user didn't pick: see KimiAppKernel.scratchDirectory.
+  case createScratchSession
   /// Forks the given session into a new branch. `messageID` is the engine
   /// message ID to branch from; nil forks the entire history up to now.
   case forkSession(UUID, messageID: String?)
@@ -34,6 +39,7 @@ public enum KimiAppCommand: Sendable, Equatable {
 
   public enum Kind: String, Codable, Sendable {
     case createSession
+    case createScratchSession
     case forkSession
     case selectSession
     case showHome
@@ -64,6 +70,7 @@ public enum KimiAppCommand: Sendable, Equatable {
   public var kind: Kind {
     switch self {
     case .createSession: .createSession
+    case .createScratchSession: .createScratchSession
     case .forkSession: .forkSession
     case .selectSession: .selectSession
     case .showHome: .showHome
@@ -129,6 +136,12 @@ public struct KimiSessionSummary: Codable, Equatable, Identifiable, Sendable {
   /// `KimiRuntimeSession.parentID`) so the sidebar can render a branch tree
   /// without a second round trip.
   public var parentRuntimeID: String?
+  /// True for sessions created via `.createScratchSession` — bound to the
+  /// app's private scratch directory instead of a user-chosen project. Never
+  /// set on a project session and never toggled after creation: a scratch
+  /// session cannot become a project session or vice versa, so its directory
+  /// binding is always what the user (or lack thereof) expects.
+  public var isScratch: Bool = false
 
   public init(
     id: UUID = UUID(),
@@ -137,7 +150,8 @@ public struct KimiSessionSummary: Codable, Equatable, Identifiable, Sendable {
     projectPath: String? = nil,
     status: SessionStatus = .idle,
     updatedAt: Date = .now,
-    parentRuntimeID: String? = nil
+    parentRuntimeID: String? = nil,
+    isScratch: Bool = false
   ) {
     self.id = id
     self.runtimeID = runtimeID
@@ -146,6 +160,7 @@ public struct KimiSessionSummary: Codable, Equatable, Identifiable, Sendable {
     self.status = status
     self.updatedAt = updatedAt
     self.parentRuntimeID = parentRuntimeID
+    self.isScratch = isScratch
   }
 }
 
