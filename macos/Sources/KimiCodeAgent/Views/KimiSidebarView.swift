@@ -6,6 +6,7 @@ struct KimiSidebarView: View {
   var onConfigureAPIKey: (() -> Void)? = nil
   var onConfigureProviders: (() -> Void)? = nil
   var onConfigureMCPServers: (() -> Void)? = nil
+  var onConfigureHooks: (() -> Void)? = nil
 
   var body: some View {
     VStack(alignment: .leading, spacing: 14) {
@@ -160,6 +161,7 @@ struct KimiSidebarView: View {
         Button("配置 API 密钥") { onConfigureAPIKey?() }
         Button("模型提供商") { onConfigureProviders?() }
         Button("MCP 服务器") { onConfigureMCPServers?() }
+        Button("高级行为规则") { onConfigureHooks?() }
         Divider()
         Button("重启运行时", action: model.restartRuntime)
       } label: {

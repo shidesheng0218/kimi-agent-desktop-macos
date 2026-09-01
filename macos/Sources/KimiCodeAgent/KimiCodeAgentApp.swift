@@ -493,6 +493,7 @@ struct KimiRootView: View {
   @State private var showAPIKeySetup = false
   @State private var showProviderSettings = false
   @State private var showMCPServers = false
+  @State private var showHookSettings = false
 
   var body: some View {
     HStack(spacing: 0) {
@@ -500,7 +501,8 @@ struct KimiRootView: View {
         model: model,
         onConfigureAPIKey: { showAPIKeySetup = true },
         onConfigureProviders: { showProviderSettings = true },
-        onConfigureMCPServers: { showMCPServers = true }
+        onConfigureMCPServers: { showMCPServers = true },
+        onConfigureHooks: { showHookSettings = true }
       )
         .frame(width: 260)
       Divider()
@@ -525,6 +527,9 @@ struct KimiRootView: View {
     }
     .sheet(isPresented: $showMCPServers) {
       KimiMCPServersView(model: model, isPresented: $showMCPServers)
+    }
+    .sheet(isPresented: $showHookSettings) {
+      KimiHookSettingsView(model: model, isPresented: $showHookSettings)
     }
     .onAppear {
       // Auto-show setup if no key is configured

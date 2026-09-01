@@ -150,10 +150,20 @@ public enum KimiHeadlessRuntimeFactory {
       }
     }
 
+    // Load the declarative hook configuration and, when non-empty, pass it as
+    // the plugin's options tuple ([spec, options]) instead of a bare spec
+    // string. The plugin (kimi-code-agent-plugin) reads these as its second
+    // factory argument — no code crosses this boundary, only flat JSON.
+    let hookStore = KimiHookConfigStore(fileURL: applicationSupportDirectory.appendingPathComponent("settings/hook-config.json"))
+    let hookConfiguration = (try? hookStore.load()) ?? KimiHookConfiguration()
+    let pluginEntry: [Any] = hookConfiguration.isEmpty
+      ? ["{env:KIMI_RUNTIME_PLUGIN}"]
+      : [["{env:KIMI_RUNTIME_PLUGIN}", hookConfiguration.toEngineOptions()]]
+
     var config: [String: Any] = [
       "model": "\(KimiRuntimeIdentityStore.providerID)/\(modelID)",
       "small_model": "\(KimiRuntimeIdentityStore.providerID)/\(modelID)",
-      "plugin": ["{env:KIMI_RUNTIME_PLUGIN}"],
+      "plugin": pluginEntry,
       "provider": providerEntries,
       "permission": ["read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "websearch": "allow", "webfetch": "allow", "task": "allow", "bash": "ask", "edit": "ask", "external_directory": "ask", "question": "ask", "skill": "ask"],
       "compaction": ["auto": true, "prune": true, "tail_turns": 8, "preserve_recent_tokens": 24000],
