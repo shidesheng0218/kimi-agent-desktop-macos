@@ -1,5 +1,19 @@
 import Foundation
 
+/// One assistant turn's terminal outcome, set explicitly by whichever engine
+/// produced the event rather than inferred by callers matching on `kind`.
+/// opencode's SSE decoder maps its own idle frames to `.completed` here; a
+/// non-SSE engine (e.g. a direct API call with no event stream of its own)
+/// synthesizes this value itself right after the call returns. This is the
+/// single contract `KimiRuntimeOperationDriver.waitForCompletion` blocks on,
+/// so any engine implementation only needs to guarantee this field, not
+/// reproduce opencode's specific idle/status wire shapes.
+public enum EngineTurnOutcome: String, Codable, Sendable {
+  case completed
+  case failed
+  case aborted
+}
+
 public enum KimiRuntimeEventKind: String, Codable, Sendable {
   case sessionCreated
   case sessionUpdated
@@ -26,7 +40,7 @@ public enum KimiRuntimeEventKind: String, Codable, Sendable {
   case unknown
 }
 
-public struct KimiRuntimeEvent: Codable, Equatable, Sendable {
+public struct EngineRuntimeEvent: Codable, Equatable, Sendable {
   public let id: UUID
   public let sessionID: String
   public let kind: KimiRuntimeEventKind
@@ -43,6 +57,9 @@ public struct KimiRuntimeEvent: Codable, Equatable, Sendable {
   public let isSnapshot: Bool
   public let payload: [String: String]
   public let createdAt: Date
+  /// Non-nil exactly on the one event per turn that declares the turn over.
+  /// See `EngineTurnOutcome`.
+  public let turnOutcome: EngineTurnOutcome?
 
   public init(
     id: UUID = UUID(),
@@ -56,7 +73,8 @@ public struct KimiRuntimeEvent: Codable, Equatable, Sendable {
     partID: String? = nil,
     isSnapshot: Bool = false,
     payload: [String: String] = [:],
-    createdAt: Date = .now
+    createdAt: Date = .now,
+    turnOutcome: EngineTurnOutcome? = nil
   ) {
     self.id = id
     self.sessionID = sessionID
@@ -70,10 +88,11 @@ public struct KimiRuntimeEvent: Codable, Equatable, Sendable {
     self.isSnapshot = isSnapshot
     self.payload = payload
     self.createdAt = createdAt
+    self.turnOutcome = turnOutcome
   }
 
   private enum CodingKeys: String, CodingKey {
-    case id, sessionID, kind, text, toolCallID, toolID, requestID, messageID, partID, isSnapshot, payload, createdAt
+    case id, sessionID, kind, text, toolCallID, toolID, requestID, messageID, partID, isSnapshot, payload, createdAt, turnOutcome
   }
 
   public init(from decoder: Decoder) throws {
@@ -90,7 +109,8 @@ public struct KimiRuntimeEvent: Codable, Equatable, Sendable {
       partID: try container.decodeIfPresent(String.self, forKey: .partID),
       isSnapshot: try container.decodeIfPresent(Bool.self, forKey: .isSnapshot) ?? false,
       payload: try container.decodeIfPresent([String: String].self, forKey: .payload) ?? [:],
-      createdAt: try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
+      createdAt: try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now,
+      turnOutcome: try container.decodeIfPresent(EngineTurnOutcome.self, forKey: .turnOutcome)
     )
   }
 }
@@ -112,7 +132,7 @@ public final class KimiRuntimeEventDecoder: @unchecked Sendable {
 
   public init() {}
 
-  public func decode(_ data: Data, sessionID: String) -> KimiRuntimeEvent? {
+  public func decode(_ data: Data, sessionID: String) -> EngineRuntimeEvent? {
     guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
     let rawType = (object["type"] as? String) ?? (object["event"] as? String) ?? "unknown"
     let loweredType = rawType.lowercased()
@@ -134,7 +154,7 @@ public final class KimiRuntimeEventDecoder: @unchecked Sendable {
       if let id = info["id"] as? String, let role { registerRole(role, for: id) }
       if role == "user" {
         messageID = info["id"] as? String ?? messageID
-        return KimiRuntimeEvent(
+        return EngineRuntimeEvent(
           sessionID: properties["sessionID"] as? String ?? sessionID,
           kind: .userText,
           messageID: messageID
@@ -147,7 +167,7 @@ public final class KimiRuntimeEventDecoder: @unchecked Sendable {
       guard field == "text", let delta = properties["delta"] as? String, !delta.isEmpty else { return nil }
       if let messageID, registeredRole(for: messageID) == "user" { return nil }
       let isReasoning = partID.map { registeredKind(for: $0) == "reasoning" } ?? false
-      return KimiRuntimeEvent(
+      return EngineRuntimeEvent(
         sessionID: properties["sessionID"] as? String ?? sessionID,
         kind: isReasoning ? .reasoningText : .assistantText,
         text: delta,
@@ -229,7 +249,17 @@ public final class KimiRuntimeEventDecoder: @unchecked Sendable {
     if let status = partState?["status"] as? String { payload["status"] = status }
     if let statusType = (properties["status"] as? [String: Any])?["type"] as? String { payload["statusType"] = statusType }
     if let error = properties["error"] { payload["error"] = Self.stringify(error) ?? "error" }
-    return KimiRuntimeEvent(
+    // opencode signals turn completion through two different wire shapes
+    // (a dedicated session.idle event, or a session.status frame whose
+    // statusType is "idle"); translate both into the one explicit contract
+    // KimiRuntimeOperationDriver actually waits on.
+    var turnOutcome: EngineTurnOutcome? = nil
+    if kind == .sessionIdle || (kind == .sessionStatus && payload["statusType"] == "idle") {
+      turnOutcome = .completed
+    } else if kind == .error {
+      turnOutcome = .failed
+    }
+    return EngineRuntimeEvent(
       sessionID: eventSessionID,
       kind: kind,
       text: text,
@@ -239,7 +269,8 @@ public final class KimiRuntimeEventDecoder: @unchecked Sendable {
       messageID: messageID,
       partID: partID,
       isSnapshot: isSnapshot,
-      payload: payload
+      payload: payload,
+      turnOutcome: turnOutcome
     )
   }
 
@@ -308,11 +339,11 @@ public enum KimiRuntimeEventBridge {
   /// One-shot decode kept for tests and diagnostics. Production subscriptions
   /// use a per-stream `KimiRuntimeEventDecoder` so reasoning classification
   /// survives across delta frames.
-  public static func decodeSSEData(_ data: Data, sessionID: String) -> KimiRuntimeEvent? {
+  public static func decodeSSEData(_ data: Data, sessionID: String) -> EngineRuntimeEvent? {
     KimiRuntimeEventDecoder().decode(data, sessionID: sessionID)
   }
 
-  public static func map(_ event: KimiRuntimeEvent) -> [KimiEvent] {
+  public static func map(_ event: EngineRuntimeEvent) -> [KimiEvent] {
     switch event.kind {
     case .assistantText:
       return event.text.map { [.assistantText(text: $0, partID: event.partID, isSnapshot: event.isSnapshot)] } ?? []

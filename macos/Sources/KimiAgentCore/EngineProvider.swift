@@ -115,7 +115,21 @@ public struct KimiRuntimeHistoryMessage: Sendable, Equatable {
   }
 }
 
-public protocol KimiRuntimeSessionClient: Sendable {
+/// One engine-agnostic execution backend. `KimiAppKernel` and
+/// `KimiRuntimeOperationDriver` talk to whichever backend is configured only
+/// through this protocol — they hold `any EngineProvider` and never branch on
+/// which concrete implementation is live. The opencode-backed
+/// `URLSessionRuntimeClient` and `AnthropicDirectEngineProvider` are two
+/// implementations of the exact same contract.
+///
+/// Every `directory` parameter is a workspace-context hint, not a literal
+/// opencode HTTP query parameter: `URLSessionRuntimeClient` forwards it as
+/// opencode's directory-routing query string (its engine process serves
+/// multiple project directories from one instance), while
+/// `AnthropicDirectEngineProvider` only reads it as an optional cwd hint for
+/// local tool execution and otherwise ignores it — a backend with no
+/// directory-routing concept of its own is free to no-op on it.
+public protocol EngineProvider: Sendable {
   func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession
   /// Forks a session via POST /session/:sessionID/fork. Passing messageID
   /// branches from that specific message; nil forks the entire history up to
@@ -126,7 +140,7 @@ public protocol KimiRuntimeSessionClient: Sendable {
   func abort(sessionID: String, directory: String?) async throws
   func respondPermission(_ input: PermissionResponse) async throws
   func listSessions(directory: String?) async throws -> [KimiRuntimeSession]
-  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error>
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error>
   func fetchMessages(sessionID: String, directory: String?) async throws -> [KimiRuntimeHistoryMessage]
   func fetchModelCatalog(directory: String?) async throws -> [String]
   func fetchTodos(sessionID: String, directory: String?) async throws -> [KimiTodoItem]
@@ -151,7 +165,7 @@ public protocol KimiRuntimeSessionClient: Sendable {
 
 /// Convenience defaults keep scripted clients in checks and smoke targets
 /// minimal; the production URLSession client provides real implementations.
-public extension KimiRuntimeSessionClient {
+public extension EngineProvider {
   func forkSession(sessionID: String, messageID: String?, directory: String?) async throws -> KimiRuntimeSession { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   func fetchMessages(sessionID: String, directory: String?) async throws -> [KimiRuntimeHistoryMessage] { [] }
   func fetchModelCatalog(directory: String?) async throws -> [String] { [] }
@@ -170,7 +184,7 @@ public extension KimiRuntimeSessionClient {
   func fetchSessionStatuses(directory: String?) async throws -> [String: String] { [:] }
 }
 
-public final class URLSessionRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+public final class URLSessionRuntimeClient: EngineProvider, @unchecked Sendable {
   private let endpoint: KimiRuntimeEndpoint
   private let directory: String?
   private let session: URLSession
@@ -416,7 +430,7 @@ public final class URLSessionRuntimeClient: KimiRuntimeSessionClient, @unchecked
     return KimiRuntimeHistoryMessage(id: id, role: role, createdAt: createdAt, parts: parts)
   }
 
-  public func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+  public func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
     let eventURL = Self.endpointURL(
       base: endpoint.baseURL,
       path: "/event",

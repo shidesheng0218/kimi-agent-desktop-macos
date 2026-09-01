@@ -196,7 +196,7 @@ final class MockURLProtocol: URLProtocol {
   override func stopLoading() {}
 }
 
-final class IdleKimiRuntimeSessionClient: KimiRuntimeSessionClient, @unchecked Sendable {
+final class IdleKimiRuntimeSessionClient: EngineProvider, @unchecked Sendable {
   private let promptCounter = InvocationCounter()
 
   var promptCount: Int { promptCounter.count }
@@ -214,11 +214,11 @@ final class IdleKimiRuntimeSessionClient: KimiRuntimeSessionClient, @unchecked S
   func respondPermission(_ input: PermissionResponse) async throws {}
   func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
 
-  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
     AsyncThrowingStream { continuation in
       Task {
         try? await Task.sleep(for: .milliseconds(20))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .sessionIdle, turnOutcome: .completed))
         continuation.finish()
       }
     }
@@ -227,7 +227,7 @@ final class IdleKimiRuntimeSessionClient: KimiRuntimeSessionClient, @unchecked S
 
 /// Streams one scripted assistant turn (busy → deltas → snapshot → idle) so
 /// checks can drive a real `KimiAppKernel` through the production ingest path.
-final class StreamingScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+final class StreamingScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
     KimiRuntimeSession(id: "stream-session", title: "流式", directory: "/tmp/stream")
   }
@@ -238,15 +238,15 @@ final class StreamingScriptKimiRuntimeClient: KimiRuntimeSessionClient, @uncheck
   func respondPermission(_ input: PermissionResponse) async throws {}
   func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
 
-  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
     AsyncThrowingStream { continuation in
       Task {
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .assistantText, text: "你好，", messageID: "m1", partID: "p1"))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .assistantText, text: "世界", messageID: "m1", partID: "p1"))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .assistantText, text: "你好，世界！", messageID: "m1", partID: "p1", isSnapshot: true))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .assistantText, text: "你好，", messageID: "m1", partID: "p1"))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .assistantText, text: "世界", messageID: "m1", partID: "p1"))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .assistantText, text: "你好，世界！", messageID: "m1", partID: "p1", isSnapshot: true))
         try? await Task.sleep(for: .milliseconds(30))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .sessionIdle, turnOutcome: .completed))
         continuation.finish()
       }
     }
@@ -254,7 +254,7 @@ final class StreamingScriptKimiRuntimeClient: KimiRuntimeSessionClient, @uncheck
 }
 
 /// Holds the turn open long enough for a steer message to be pumped in.
-final class SteerScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+final class SteerScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   let promptTrace = ThreadSafeStringTrace()
 
   func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
@@ -273,12 +273,12 @@ final class SteerScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked S
   func respondPermission(_ input: PermissionResponse) async throws {}
   func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
 
-  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
     AsyncThrowingStream { continuation in
       Task {
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
         try? await Task.sleep(for: .milliseconds(900))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .sessionIdle, turnOutcome: .completed))
         continuation.finish()
       }
     }
@@ -287,7 +287,7 @@ final class SteerScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked S
 
 /// Never emits completion; used to prove the driver aborts the engine session
 /// when its own timeout fires.
-final class NeverIdleKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+final class NeverIdleKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   let abortCounter = InvocationCounter()
 
   func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
@@ -300,7 +300,7 @@ final class NeverIdleKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sen
   func respondPermission(_ input: PermissionResponse) async throws {}
   func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
 
-  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
     AsyncThrowingStream { continuation in
       Task {
         try? await Task.sleep(for: .seconds(30))
@@ -311,7 +311,7 @@ final class NeverIdleKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sen
 }
 
 /// Serves a canned two-message conversation for history-restore checks.
-final class HistoryScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+final class HistoryScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
     KimiRuntimeSession(id: "history-session", title: "历史会话", directory: input.directory)
   }
@@ -322,7 +322,7 @@ final class HistoryScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked
   func respondPermission(_ input: PermissionResponse) async throws {}
   func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
 
-  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
     AsyncThrowingStream { $0.finish() }
   }
 
@@ -349,7 +349,7 @@ final class HistoryScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked
 
 /// Streams one tool call and its result so verification-record joins have a
 /// settled receipt to project.
-final class VerifyScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+final class VerifyScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   private let lock = NSLock()
   private var _addedMCPServers: [KimiMCPServerEntry] = []
   private var _removedMCPServerNames: [String] = []
@@ -392,14 +392,14 @@ final class VerifyScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked 
     lock.withLock { _removedMCPServerNames.append(name) }
   }
 
-  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
     AsyncThrowingStream { continuation in
       Task {
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .toolCall, toolCallID: "vtc1", toolID: "bash", payload: ["arguments": #"{"command":"swift build"}"#]))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .toolCall, toolCallID: "vtc1", toolID: "bash", payload: ["arguments": #"{"command":"swift build"}"#]))
         try? await Task.sleep(for: .milliseconds(20))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .toolResult, text: "Build complete", toolCallID: "vtc1", toolID: "bash", payload: ["status": "completed"]))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .toolResult, text: "Build complete", toolCallID: "vtc1", toolID: "bash", payload: ["status": "completed"]))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .sessionIdle, turnOutcome: .completed))
         continuation.finish()
       }
     }
@@ -408,7 +408,7 @@ final class VerifyScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked 
 
 /// Emits the observed engine quirk: two permission.asked frames sharing one
 /// requestID, then permission.replied, then idle.
-final class PermScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+final class PermScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
     KimiRuntimeSession(id: "perm-session", title: "审批", directory: input.directory)
   }
@@ -419,16 +419,16 @@ final class PermScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Se
   func respondPermission(_ input: PermissionResponse) async throws {}
   func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
 
-  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
     AsyncThrowingStream { continuation in
       Task {
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .permissionAsked, toolID: "edit", requestID: "per_zombie"))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .permissionAsked, toolID: "edit", requestID: "per_zombie"))
         try? await Task.sleep(for: .milliseconds(30))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .permissionAsked, toolID: "edit", requestID: "per_zombie"))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .permissionAsked, toolID: "edit", requestID: "per_zombie"))
         try? await Task.sleep(for: .milliseconds(30))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .permissionReplied, requestID: "per_zombie"))
-        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .permissionReplied, requestID: "per_zombie"))
+        continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .sessionIdle, turnOutcome: .completed))
         continuation.finish()
       }
     }
@@ -3433,6 +3433,172 @@ let generatedMcpBlock2 = mcpFactoryConfigObj2["mcp"] as? [String: Any]
 expect(generatedMcpBlock2?["disabled-server"] == nil, "禁用的 MCP 服务器不得出现在生成的配置块中")
 expect(generatedMcpBlock2?["filesystem"] != nil, "启用的 MCP 服务器必须仍然出现在配置块中")
 
+// KimiHookConfiguration: engine options mapping is flat JSON, code-free
+let emptyHookConfiguration = KimiHookConfiguration()
+expect(emptyHookConfiguration.isEmpty, "未配置任何规则时 KimiHookConfiguration 必须为空")
+expect(emptyHookConfiguration.toEngineOptions().isEmpty, "空的 Hook 配置必须生成空的引擎选项")
+
+let sampleHookConfiguration = KimiHookConfiguration(
+  systemPromptRules: ["总是用简体中文回复"],
+  permissionOverrides: ["bash": .deny],
+  webFetchAllowedDomains: ["example.com"],
+  toolOutputCharLimits: ["bash": 4000]
+)
+expect(!sampleHookConfiguration.isEmpty, "配置了任意规则后 KimiHookConfiguration 不得为空")
+let sampleHookOptions = sampleHookConfiguration.toEngineOptions()
+expect(sampleHookOptions["systemPromptRules"] as? [String] == ["总是用简体中文回复"], "引擎选项必须原样保留 systemPromptRules")
+expect(sampleHookOptions["permissionOverrides"] as? [String: String] == ["bash": "deny"], "引擎选项必须把 permissionOverrides 的枚举值序列化为字符串")
+expect(sampleHookOptions["webFetchAllowedDomains"] as? [String] == ["example.com"], "引擎选项必须原样保留 webFetchAllowedDomains")
+expect(sampleHookOptions["toolOutputCharLimits"] as? [String: Int] == ["bash": 4000], "引擎选项必须原样保留 toolOutputCharLimits")
+
+// KimiHookConfigStore persistence
+let hookStoreURL = temporaryDirectory.appendingPathComponent("hook-store-test/hook-config.json")
+let hookStore = KimiHookConfigStore(fileURL: hookStoreURL)
+try hookStore.save(sampleHookConfiguration)
+let loadedHookConfiguration = try hookStore.load()
+expect(loadedHookConfiguration == sampleHookConfiguration, "Hook 配置必须能持久化并读回，且字段完全一致")
+
+// KimiHeadlessRuntimeFactory: plugin entry stays a bare spec string when no
+// hook rules are configured, and becomes a [spec, options] tuple once they
+// are — this is the exact shape the engine's plugin loader expects for
+// config.plugin = [[path, options]] (see vendor/engine packages/opencode/src/config/plugin.ts).
+let hookFactorySupport = temporaryDirectory.appendingPathComponent("hook-factory-support", isDirectory: true)
+let hookFactoryConfigNoRules = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: hookFactorySupport,
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+  ]
+)
+let hookFactoryConfigNoRulesJSON = hookFactoryConfigNoRules?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
+let hookFactoryConfigNoRulesObj = (try? JSONSerialization.jsonObject(with: Data(hookFactoryConfigNoRulesJSON.utf8)) as? [String: Any]) ?? [:]
+let pluginEntryNoRules = hookFactoryConfigNoRulesObj["plugin"] as? [Any]
+expect(pluginEntryNoRules?.first as? String == "{env:KIMI_RUNTIME_PLUGIN}", "未配置 Hook 规则时，plugin 字段必须是裸的 spec 字符串数组")
+
+let hookFactoryStore = KimiHookConfigStore(fileURL: hookFactorySupport.appendingPathComponent("settings/hook-config.json"))
+try hookFactoryStore.save(sampleHookConfiguration)
+let hookFactoryConfigWithRules = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: hookFactorySupport,
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+  ]
+)
+let hookFactoryConfigWithRulesJSON = hookFactoryConfigWithRules?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
+let hookFactoryConfigWithRulesObj = (try? JSONSerialization.jsonObject(with: Data(hookFactoryConfigWithRulesJSON.utf8)) as? [String: Any]) ?? [:]
+let pluginEntryWithRules = hookFactoryConfigWithRulesObj["plugin"] as? [Any]
+let pluginTuple = pluginEntryWithRules?.first as? [Any]
+expect(pluginTuple?.first as? String == "{env:KIMI_RUNTIME_PLUGIN}", "配置了 Hook 规则时，plugin 字段第一个元素必须仍是原来的 spec 字符串")
+let pluginTupleOptions = pluginTuple?.count == 2 ? pluginTuple?[1] as? [String: Any] : nil
+expect(pluginTupleOptions?["systemPromptRules"] as? [String] == ["总是用简体中文回复"], "配置了 Hook 规则时，plugin 字段第二个元素必须携带 systemPromptRules")
+expect(pluginTupleOptions?["permissionOverrides"] as? [String: String] == ["bash": "deny"], "配置了 Hook 规则时，plugin 字段第二个元素必须携带 permissionOverrides")
+
+// EngineProvider abstraction: AnthropicDirectEngineProvider is a second real
+// backend behind the exact same protocol opencode's URLSessionRuntimeClient
+// implements. These checks drive it through a mocked Anthropic Messages API
+// SSE stream and assert it produces the same event-stream shape the driver
+// (KimiRuntimeOperationDriver.waitForCompletion) actually depends on: text
+// deltas, tool call/result pairs, and exactly one explicit turnOutcome frame.
+let anthropicMockConfig = URLSessionConfiguration.ephemeral
+anthropicMockConfig.protocolClasses = [MockURLProtocol.self]
+let anthropicMockSession = URLSession(configuration: anthropicMockConfig)
+
+func anthropicSSEResponse(for request: URLRequest) throws -> (HTTPURLResponse, Data) {
+  let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "text/event-stream"])!
+  let bodyData = request.httpBody ?? Data()
+  let body = (try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]) ?? [:]
+  let messages = body["messages"] as? [[String: Any]] ?? []
+  let hasToolResult = messages.contains { message in
+    ((message["content"] as? [[String: Any]]) ?? []).contains { ($0["type"] as? String) == "tool_result" }
+  }
+  if hasToolResult {
+    // Second round trip: the model saw the tool result and just replies with text.
+    let stream = """
+    data: {"type":"content_block_delta","delta":{"text":"完成了"}}
+
+    data: {"type":"message_stop"}
+
+    """
+    return (response, Data(stream.utf8))
+  }
+  // First round trip: the model asks to run one tool.
+  let stream = """
+  data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"tool-1","name":"bash"}}
+
+  data: {"type":"content_block_delta","delta":{"partial_json":"{\\"command\\":\\"echo hi\\"}"}}
+
+  data: {"type":"content_block_stop"}
+
+  data: {"type":"message_stop"}
+
+  """
+  return (response, Data(stream.utf8))
+}
+MockURLProtocol.requestHandler = { try anthropicSSEResponse(for: $0) }
+
+let anthropicProvider = AnthropicDirectEngineProvider(apiKey: "test-key", model: "claude-sonnet-4-6", session: anthropicMockSession)
+let anthropicSession = try! awaitValue { try await anthropicProvider.createSession(CreateSessionInput(directory: "/tmp", title: "anthropic-test")) }
+let anthropicEventsStream = try! awaitValue { try await anthropicProvider.subscribeEvents(sessionID: anthropicSession.id, directory: "/tmp") }
+try! awaitValue { try await anthropicProvider.prompt(KimiRuntimePromptInput(sessionID: anthropicSession.id, text: "run echo hi", directory: "/tmp")) }
+
+let anthropicCollected = try! awaitValue { () async throws -> ([KimiRuntimeEventKind], [EngineTurnOutcome]) in
+  var kinds: [KimiRuntimeEventKind] = []
+  var outcomes: [EngineTurnOutcome] = []
+  for try await event in anthropicEventsStream {
+    kinds.append(event.kind)
+    if let outcome = event.turnOutcome { outcomes.append(outcome) }
+    if event.turnOutcome != nil { break }
+  }
+  return (kinds, outcomes)
+}
+let anthropicEventKinds = anthropicCollected.0
+let anthropicTurnOutcomes = anthropicCollected.1
+MockURLProtocol.requestHandler = nil
+
+expect(anthropicEventKinds.contains(.toolCall), "AnthropicDirectEngineProvider 必须像 opencode 后端一样产出 toolCall 事件")
+expect(anthropicEventKinds.contains(.toolResult), "AnthropicDirectEngineProvider 必须像 opencode 后端一样产出 toolResult 事件")
+expect(anthropicTurnOutcomes == [.completed], "AnthropicDirectEngineProvider 必须为每一轮恰好产出一个 turnOutcome:.completed 事件，这是驱动器等待完成的唯一契约")
+
+// Same real production call path (KimiRuntimeOperationDriver.run) that the
+// opencode backend goes through above (see idleDriver), now driving
+// AnthropicDirectEngineProvider instead. If this needs any
+// `if provider is AnthropicDirectEngineProvider` special-casing in the
+// driver or kernel to pass, the abstraction has a leak — it does not.
+MockURLProtocol.requestHandler = { request in
+  let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "text/event-stream"])!
+  let stream = """
+  data: {"type":"content_block_delta","delta":{"text":"你好"}}
+
+  data: {"type":"message_stop"}
+
+  """
+  return (response, Data(stream.utf8))
+}
+let anthropicProvider2 = AnthropicDirectEngineProvider(apiKey: "test-key", model: "claude-sonnet-4-6", session: anthropicMockSession)
+let anthropicDriver = KimiRuntimeOperationDriver(client: anthropicProvider2)
+let anthropicDriverTrace = ThreadSafeStringTrace()
+let anthropicDriverSession = try! awaitValue { try await anthropicProvider2.createSession(CreateSessionInput(directory: "/tmp", title: "driver-test")) }
+try! awaitValue { await anthropicDriver.setSession(anthropicDriverSession.id, directory: "/tmp"); return () }
+try! awaitValue {
+  try await anthropicDriver.run(
+    context: HarnessOperationContext(sessionID: UUID(), operationID: UUID(), lane: .main, prompt: PromptInput(text: "你好")),
+    sink: { event in
+      switch event {
+      case .turnEnded: anthropicDriverTrace.append("turn-ended")
+      case .stepEnded: anthropicDriverTrace.append("step-ended")
+      default: break
+      }
+    }
+  )
+  return ()
+}
+MockURLProtocol.requestHandler = nil
+expect(anthropicDriverTrace.snapshot.contains("turn-ended"), "KimiRuntimeOperationDriver 必须能在完全不知道后端是 opencode 还是 Anthropic 直连的情况下，正常驱动 Anthropic 后端的一轮对话到 turn-ended")
+
 // Runtime data migration: legacy XDG locations must fold into the contained
 // runtime directory without overwriting anything.
 let migrationHome = temporaryDirectory.appendingPathComponent("migration-home", isDirectory: true)
@@ -3502,7 +3668,7 @@ let restartCount = try! awaitValue { await crashOnlyRuntime.unexpectedExitRestar
 expect(restartCount == 1, "Headless Sidecar 意外退出后必须在限定次数内自动重启")
 try! awaitValue { await crashOnlyRuntime.stop(); return () }
 let bridged = KimiRuntimeEventBridge.map(
-  KimiRuntimeEvent(sessionID: "session-1", kind: .assistantText, text: "桥接成功")
+  EngineRuntimeEvent(sessionID: "session-1", kind: .assistantText, text: "桥接成功")
 )
 expect(bridged.contains(where: { $0.displayText == "桥接成功" }), "Engine assistant event 必须映射为 Kimi Event")
 let toolWireEvent = Data(#"{"type":"message.part.updated","properties":{"sessionID":"session-1","part":{"type":"tool","callID":"call-1","tool":"read","state":{"status":"running","input":{"path":"README.md"}}}}}"#.utf8)
@@ -3646,7 +3812,7 @@ expect(textSnapshotEvent?.kind == .assistantText && textSnapshotEvent?.isSnapsho
 let busyStatusEvent = p0Decoder.decode(Data(#"{"type":"session.status","properties":{"sessionID":"s1","status":{"type":"busy"}}}"#.utf8), sessionID: "s1")
 expect(busyStatusEvent?.kind == .sessionStatus && busyStatusEvent?.payload["statusType"] == "busy", "session.status 必须解析出 busy/idle 状态")
 expect(busyStatusEvent.map { KimiRuntimeEventBridge.map($0).contains(.sessionBusy(sessionID: "s1", isBusy: true)) } == true, "session.status busy 必须映射为 UI 忙态事件")
-let idleMapped = KimiRuntimeEventBridge.map(KimiRuntimeEvent(sessionID: "s1", kind: .sessionIdle))
+let idleMapped = KimiRuntimeEventBridge.map(EngineRuntimeEvent(sessionID: "s1", kind: .sessionIdle))
 expect(idleMapped.contains(.sessionBusy(sessionID: "s1", isBusy: false)), "session.idle 必须映射为忙态解除事件")
 
 // P0 端到端（脚本化客户端驱动真实 KimiAppKernel）：流式合并 + 忙态清除

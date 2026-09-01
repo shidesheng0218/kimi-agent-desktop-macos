@@ -104,10 +104,25 @@ public enum KimiRuntimeError: LocalizedError, Equatable, Sendable {
   }
 }
 
+/// Process-management surface an `EngineProvider` backend needs only when it
+/// actually runs as a child process. An in-process backend (an SDK call with
+/// no subprocess, no port to health-check) implements `EngineProvider` alone
+/// and never conforms to this — `KimiAppKernel` holds it as an optional so
+/// such backends aren't forced to fake a process lifecycle they don't have.
+public protocol EngineProcessLifecycle: Actor {
+  func snapshot() -> (state: KimiRuntimeState, endpoint: KimiRuntimeEndpoint)
+  func stateChanges() -> AsyncStream<KimiRuntimeState>
+  func start() throws -> KimiRuntimeEndpoint
+  func stop()
+  func restart() throws -> KimiRuntimeEndpoint
+  func reconfigure(_ newConfiguration: KimiRuntimeConfiguration) async throws
+  func waitUntilReady() async throws
+}
+
 /// Owns the embedded engine server process without exposing Process management to the
 /// SwiftUI layer. The production bundle supplies the executable and runtime;
 /// development may point this at a local Bun/Node command.
-public actor KimiRuntimeSupervisor {
+public actor KimiRuntimeSupervisor: EngineProcessLifecycle {
   private var configuration: KimiRuntimeConfiguration
   private var process: KimiProcessHandle?
   private var state: KimiRuntimeState = .stopped {

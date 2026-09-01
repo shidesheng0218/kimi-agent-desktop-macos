@@ -8,13 +8,13 @@ public struct KimiDriverTimeoutError: Error, Sendable {
 }
 
 public actor KimiRuntimeOperationDriver {
-  private let client: any KimiRuntimeSessionClient
+  private let client: any EngineProvider
   private let completionTimeout: Duration
   private var sessionID: String?
   private var directory: String?
   private var modelID: String = KimiRuntimeIdentityStore.defaultModelID
 
-  public init(client: any KimiRuntimeSessionClient, completionTimeout: Duration = .seconds(1_800)) {
+  public init(client: any EngineProvider, completionTimeout: Duration = .seconds(1_800)) {
     self.client = client
     self.completionTimeout = completionTimeout
   }
@@ -73,20 +73,18 @@ public actor KimiRuntimeOperationDriver {
   }
 
   private static func waitForCompletion(
-    _ events: AsyncThrowingStream<KimiRuntimeEvent, Error>,
+    _ events: AsyncThrowingStream<EngineRuntimeEvent, Error>,
     timeout: Duration
   ) async throws {
     try await withThrowingTaskGroup(of: Void.self) { group in
       group.addTask {
         for try await event in events {
-          switch event.kind {
-          case .sessionIdle:
+          switch event.turnOutcome {
+          case .completed:
             return
-          case .sessionStatus:
-            if event.payload["statusType"] == "idle" { return }
-          case .error:
+          case .failed, .aborted:
             throw KimiRuntimeError.requestFailed(event.text ?? "执行会话失败。")
-          default:
+          case nil:
             continue
           }
         }
@@ -106,7 +104,7 @@ public actor KimiRuntimeOperationDriver {
 /// through this actor. The embedded engine remains the headless execution service; the
 /// Harness records the operation boundary and provides recovery semantics.
 public actor KimiAppKernel {
-  private let sessionClient: any KimiRuntimeSessionClient
+  private let sessionClient: any EngineProvider
   private let runtimeSupervisor: KimiRuntimeSupervisor?
   private let operationDriver: KimiRuntimeOperationDriver
   private let harness: AgentHarness
@@ -136,7 +134,7 @@ public actor KimiAppKernel {
   private var lastTextPersistAt: Date = .distantPast
 
   public init(
-    sessionClient: any KimiRuntimeSessionClient = UnavailableKimiRuntimeSessionClient(),
+    sessionClient: any EngineProvider = UnavailableKimiRuntimeSessionClient(),
     runtimeSupervisor: KimiRuntimeSupervisor? = nil,
     sessionID: UUID = UUID(),
     persistence: KimiAppStateStore? = nil,
@@ -702,7 +700,7 @@ public actor KimiAppKernel {
           await self?.ingest(event)
         }
       } catch {
-        await self?.ingest(KimiRuntimeEvent(sessionID: sessionID, kind: .error, text: error.localizedDescription))
+        await self?.ingest(EngineRuntimeEvent(sessionID: sessionID, kind: .error, text: error.localizedDescription))
       }
       await self?.eventStreamDidEnd(sessionID: sessionID, token: token)
     }
@@ -802,7 +800,7 @@ public actor KimiAppKernel {
     state.sessions.first(where: { $0.runtimeID == runtimeID })?.projectPath
   }
 
-  private func ingest(_ event: KimiRuntimeEvent) async {
+  private func ingest(_ event: EngineRuntimeEvent) async {
     if event.kind == .error, recentlyAbortedSessions.remove(event.sessionID) != nil {
       return
     }
@@ -983,7 +981,7 @@ public actor KimiAppKernel {
     persistState()
   }
 
-  private func recordKimiRuntimeEvent(_ event: KimiRuntimeEvent) async {
+  private func recordKimiRuntimeEvent(_ event: EngineRuntimeEvent) async {
     guard let operationID = sessionOperations[event.sessionID] else { return }
     let snapshot = await harness.snapshot()
     let checkpoint = snapshot.checkpoints[operationID]
@@ -991,10 +989,10 @@ public actor KimiAppKernel {
     let step = checkpoint?.step ?? 1
     switch event.kind {
     case .sessionIdle, .sessionStatus:
-      let isIdle = event.kind == .sessionIdle || event.payload["statusType"] == "idle"
       // One assistantMessage record per completed turn feeds the dashboard's
-      // model-usage distribution; both idle frame shapes map to the same turn.
-      guard isIdle, !recordedAssistantTurns.contains(turnID) else { return }
+      // model-usage distribution; every engine's idle signal funnels through
+      // the same explicit turnOutcome contract, regardless of wire shape.
+      guard event.turnOutcome == .completed, !recordedAssistantTurns.contains(turnID) else { return }
       if recordedAssistantTurns.count > 256 { recordedAssistantTurns.removeAll() }
       recordedAssistantTurns.insert(turnID)
       await harness.record(
@@ -1133,7 +1131,7 @@ public actor KimiAppKernel {
   }
 }
 
-public final class UnavailableKimiRuntimeSessionClient: KimiRuntimeSessionClient, @unchecked Sendable {
+public final class UnavailableKimiRuntimeSessionClient: EngineProvider, @unchecked Sendable {
   public init() {}
 
   public func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
@@ -1145,7 +1143,7 @@ public final class UnavailableKimiRuntimeSessionClient: KimiRuntimeSessionClient
   public func abort(sessionID: String, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   public func respondPermission(_ input: PermissionResponse) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   public func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
-  public func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
+  public func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   public func fetchMessages(sessionID: String, directory: String?) async throws -> [KimiRuntimeHistoryMessage] { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   public func fetchModelCatalog(directory: String?) async throws -> [String] { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
 }
