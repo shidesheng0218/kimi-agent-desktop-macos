@@ -1,44 +1,36 @@
 import SwiftUI
 import KimiAgentCore
 
-/// Management view for MCP servers. Lists configured servers with live status
-/// (from the engine's GET /mcp endpoint), allows adding/editing/removing
-/// entries, and offers two save paths: write to config + restart engine, or
-/// add at runtime via POST /mcp without restart.
-struct KimiMCPServersView: View {
+/// MCP server management pane. Every add/edit/remove takes effect
+/// immediately at runtime (POST /mcp, POST /mcp/{name}/disconnect) and is
+/// also persisted to disk so it survives the next engine relaunch — there is
+/// nothing here that needs the "pending changes, apply once" flow the
+/// account and hooks panes use, so this pane has no draft state and no
+/// restart button.
+struct KimiMCPSettingsPane: View {
   @ObservedObject var model: KimiAppViewModel
-  @Binding var isPresented: Bool
 
   @State private var servers: [KimiMCPServerEntry] = []
   @State private var mcpStatuses: [KimiMcpServerStatus] = []
   @State private var editingServer: KimiMCPServerEntry? = nil
   @State private var showEditor = false
   @State private var errorMessage: String? = nil
-  @State private var isSaving = false
+  @State private var serverPendingDeletion: KimiMCPServerEntry? = nil
 
   private let mcpStore: KimiMCPServerStore
 
-  init(model: KimiAppViewModel, isPresented: Binding<Bool>) {
+  init(model: KimiAppViewModel) {
     self.model = model
-    self._isPresented = isPresented
     let support = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Application Support/Kimi Code Agent", isDirectory: true)
     self.mcpStore = KimiMCPServerStore(fileURL: support.appendingPathComponent("settings/mcp-servers.json"))
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 20) {
-      // Header
+    VStack(alignment: .leading, spacing: KimiSettingsLayout.sectionSpacing) {
       HStack {
         VStack(alignment: .leading, spacing: 6) {
-          HStack(spacing: 10) {
-            Image(systemName: "server.rack")
-              .font(.title2)
-              .foregroundStyle(KimiDesign.primary)
-            Text("MCP 服务器")
-              .font(.title2.weight(.semibold))
-          }
-          Text("管理 Model Context Protocol 服务器。本地命令通过 stdio 连接，远程服务通过 HTTP/SSE 连接。")
+          Text("管理 Model Context Protocol 服务器。本地命令通过 stdio 连接，远程服务通过 HTTP/SSE 连接。改动立即生效，无需重启引擎。")
             .font(.subheadline)
             .foregroundStyle(KimiDesign.muted)
         }
@@ -50,7 +42,6 @@ struct KimiMCPServersView: View {
         .tint(KimiDesign.primary)
       }
 
-      // Server list
       ScrollView {
         if servers.isEmpty {
           VStack(spacing: 12) {
@@ -67,16 +58,15 @@ struct KimiMCPServersView: View {
           .frame(maxWidth: .infinity)
           .padding(.vertical, 60)
         } else {
-          LazyVStack(spacing: 12) {
+          LazyVStack(spacing: KimiSettingsLayout.itemSpacing) {
             ForEach(servers) { server in
               serverRow(server)
             }
           }
         }
       }
-      .frame(maxHeight: 400)
+      .frame(maxHeight: KimiSettingsLayout.maxScrollHeight)
 
-      // Error message
       if let error = errorMessage {
         HStack(spacing: 6) {
           Image(systemName: "exclamationmark.circle")
@@ -86,22 +76,9 @@ struct KimiMCPServersView: View {
         .foregroundStyle(.red)
         .padding(10)
         .background(Color.red.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-      }
-
-      // Actions
-      HStack {
-        Button("关闭") { isPresented = false }
-          .buttonStyle(.bordered)
-        Spacer()
-        Button("保存并重启引擎") { saveAndRestart() }
-          .buttonStyle(.borderedProminent)
-          .tint(KimiDesign.primary)
-          .disabled(isSaving)
+        .clipShape(RoundedRectangle(cornerRadius: KimiSettingsLayout.cornerRadius))
       }
     }
-    .padding(24)
-    .frame(width: 560)
     .task {
       await loadServers()
       await loadStatuses()
@@ -118,12 +95,24 @@ struct KimiMCPServersView: View {
         )
       }
     }
+    .alert(
+      "删除 MCP 服务器？",
+      isPresented: Binding(
+        get: { serverPendingDeletion != nil },
+        set: { if !$0 { serverPendingDeletion = nil } }
+      ),
+      presenting: serverPendingDeletion
+    ) { server in
+      Button("删除", role: .destructive) { confirmDelete(server) }
+      Button("取消", role: .cancel) { serverPendingDeletion = nil }
+    } message: { server in
+      Text("将立即断开并删除“\(server.id)”，此操作无法撤销。")
+    }
   }
 
   private func serverRow(_ server: KimiMCPServerEntry) -> some View {
     let status = mcpStatuses.first { $0.name == server.id }
     return HStack(spacing: 12) {
-      // Status indicator
       Circle()
         .fill(statusColor(status?.status))
         .frame(width: 10, height: 10)
@@ -159,7 +148,7 @@ struct KimiMCPServersView: View {
         Button("编辑") { editServer(server) }
           .buttonStyle(.borderless)
           .font(.caption)
-        Button("删除") { deleteServer(server) }
+        Button("删除") { serverPendingDeletion = server }
           .buttonStyle(.borderless)
           .foregroundStyle(.red)
           .font(.caption)
@@ -197,7 +186,7 @@ struct KimiMCPServersView: View {
   }
 
   private func loadStatuses() async {
-    mcpStatuses = (try? await model.kernel.loadIntegrationStatus().mcpServers) ?? []
+    mcpStatuses = await model.kernel.loadIntegrationStatus().mcpServers
   }
 
   private func addNewServer() {
@@ -217,12 +206,9 @@ struct KimiMCPServersView: View {
 
   /// Persists to the on-disk config (so it survives the next engine
   /// relaunch) and, if the server is enabled, also tries the engine's live
-  /// `POST /mcp` endpoint so it connects immediately without waiting for a
-  /// restart. The runtime add is best-effort: if the engine rejects it (e.g.
-  /// a malformed command, or the engine isn't running), the entry is still
-  /// saved to disk and will be picked up on the next restart via
-  /// `saveAndRestart()` — this mirrors `KimiHeadlessRuntimeFactory`'s config
-  /// generator, which is the source of truth for what loads at launch.
+  /// `POST /mcp` endpoint so it connects immediately without a restart. The
+  /// runtime add is best-effort: if the engine rejects it, the entry is
+  /// still saved to disk and will be picked up on the next restart.
   private func saveServer(_ server: KimiMCPServerEntry) {
     do {
       try mcpStore.add(server)
@@ -238,15 +224,16 @@ struct KimiMCPServersView: View {
         try await model.kernel.addMCPServerAtRuntime(server)
         await loadStatuses()
       } catch {
-        // Best-effort: the entry is already saved to disk, so a runtime-add
-        // failure just means it activates on the next restart instead of
-        // immediately. Surface it without blocking the save the user asked
-        // for.
         await MainActor.run {
           errorMessage = "已保存，但立即连接失败（将在下次重启引擎时生效）: \(error.localizedDescription)"
         }
       }
     }
+  }
+
+  private func confirmDelete(_ server: KimiMCPServerEntry) {
+    serverPendingDeletion = nil
+    deleteServer(server)
   }
 
   /// Removes from the on-disk config and, best-effort, disconnects it from
@@ -266,27 +253,8 @@ struct KimiMCPServersView: View {
         try await model.kernel.removeMCPServerAtRuntime(name: server.id)
         await loadStatuses()
       } catch {
-        // Best-effort: the entry is already removed from disk, so it won't
-        // come back on the next restart even if the live disconnect failed
-        // (e.g. the engine wasn't running, or never had this server
-        // connected in the first place).
         await MainActor.run {
           errorMessage = "已删除配置，但断开运行中的连接失败: \(error.localizedDescription)"
-        }
-      }
-    }
-  }
-
-  private func saveAndRestart() {
-    isSaving = true
-    errorMessage = nil
-    Task {
-      do {
-        // Restart the engine to pick up the new MCP config
-        try? await model.kernel.send(.restartRuntime)
-        await MainActor.run {
-          isSaving = false
-          isPresented = false
         }
       }
     }
@@ -375,12 +343,10 @@ struct KimiMCPServerEditorView: View {
   }
 
   private func save() {
-    // Parse command from space-separated text
     if server.transport == .local {
       server.command = commandText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         ? nil
         : commandText.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-      // Parse environment from KEY=VALUE lines
       var env: [String: String] = [:]
       for line in environmentText.components(separatedBy: .newlines) {
         let parts = line.components(separatedBy: "=")
@@ -390,7 +356,6 @@ struct KimiMCPServerEditorView: View {
       }
       server.environment = env.isEmpty ? nil : env
     } else {
-      // Parse headers from Key: Value lines
       var headers: [String: String] = [:]
       for line in headersText.components(separatedBy: .newlines) {
         let parts = line.components(separatedBy: ":")

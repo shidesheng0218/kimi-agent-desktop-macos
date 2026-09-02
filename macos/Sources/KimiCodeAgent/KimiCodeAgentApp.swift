@@ -47,6 +47,12 @@ struct KimiCodeAgentApp: App {
         }
       }
     }
+    // Occupies the .appSettings command slot (⌘, + the "设置…" app menu item)
+    // for free — no manual window management needed. Replaces four
+    // independent sheets that used to hang off KimiRootView.
+    Settings {
+      KimiSettingsView(model: model)
+    }
   }
 }
 
@@ -268,29 +274,16 @@ final class KimiAppViewModel: ObservableObject {
 
   // MARK: - API key management
 
-  /// Returns true when a non-empty API key is saved in the credential vault.
+  /// Returns true when any provider has a credential saved. Checks the
+  /// per-provider Keychain buckets via KimiRuntimeIdentityStore rather than
+  /// the old single legacy key — that legacy key gets migrated into a
+  /// per-provider bucket and deleted by migrateIfNeeded(), so checking it
+  /// directly would report "not configured" even right after a successful
+  /// first-time save.
   @MainActor
   func loadAPIKeyStatus() -> Bool {
-    let vault = MacKeychainCredentialVault()
-    return (try? vault.read(key: "kimi.runtime.identity.apiKey"))?
-      .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-  }
-
-  /// Saves the key to the Keychain and restarts the engine so it takes effect.
-  func saveAPIKey(_ apiKey: String) {
-    let vault = MacKeychainCredentialVault()
-    let store = KimiRuntimeIdentityStore(vault: vault)
-    do {
-      try store.connectAPI(apiKey: apiKey)
-      Task {
-        try? await kernel.send(.restartRuntime)
-        await refresh()
-      }
-    } catch {
-      Task { @MainActor in
-        self.state.lastError = "API 密钥保存失败：\(error.localizedDescription)"
-      }
-    }
+    let store = KimiRuntimeIdentityStore(vault: MacKeychainCredentialVault())
+    return !((try? store.configuredProviderIDs()) ?? []).isEmpty
   }
 
   func restartRuntime() {
@@ -490,19 +483,13 @@ enum KimiDesign {
 
 struct KimiRootView: View {
   @ObservedObject var model: KimiAppViewModel
-  @State private var showAPIKeySetup = false
-  @State private var showProviderSettings = false
-  @State private var showMCPServers = false
-  @State private var showHookSettings = false
+  @Environment(\.openSettings) private var openSettings
 
   var body: some View {
     HStack(spacing: 0) {
       KimiSidebarView(
         model: model,
-        onConfigureAPIKey: { showAPIKeySetup = true },
-        onConfigureProviders: { showProviderSettings = true },
-        onConfigureMCPServers: { showMCPServers = true },
-        onConfigureHooks: { showHookSettings = true }
+        onOpenSettings: { openSettings() }
       )
         .frame(width: 260)
       Divider()
@@ -519,22 +506,13 @@ struct KimiRootView: View {
     }
     .background(KimiDesign.background)
     .preferredColorScheme(.light)
-    .sheet(isPresented: $showAPIKeySetup) {
-      KimiAPIKeySetupView(model: model, isPresented: $showAPIKeySetup)
-    }
-    .sheet(isPresented: $showProviderSettings) {
-      KimiProviderSettingsView(model: model, isPresented: $showProviderSettings)
-    }
-    .sheet(isPresented: $showMCPServers) {
-      KimiMCPServersView(model: model, isPresented: $showMCPServers)
-    }
-    .sheet(isPresented: $showHookSettings) {
-      KimiHookSettingsView(model: model, isPresented: $showHookSettings)
-    }
     .onAppear {
-      // Auto-show setup if no key is configured
+      // No provider configured yet: open the settings window instead of a
+      // forced, uncancellable modal — the user can still dismiss it, since
+      // there's no good way to block "use the app" from here without also
+      // reintroducing the old first-run trap.
       if !model.loadAPIKeyStatus() {
-        showAPIKeySetup = true
+        openSettings()
       }
     }
   }

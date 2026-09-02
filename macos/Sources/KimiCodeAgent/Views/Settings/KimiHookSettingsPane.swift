@@ -1,14 +1,17 @@
 import SwiftUI
 import KimiAgentCore
 
-/// Declarative hook configuration panel. Every control here maps to one of
+/// Declarative hook configuration pane. Every control here maps to one of
 /// the four flat JSON knobs the engine's kimi-code-agent-plugin reads from
 /// its plugin options tuple (KimiHookConfiguration.toEngineOptions()) — no
-/// field accepts code, only text/toggles. Mirrors KimiMCPServersView's
-/// load/edit/save-and-restart shape.
-struct KimiHookSettingsView: View {
-  @ObservedObject var model: KimiAppViewModel
-  @Binding var isPresented: Bool
+/// field accepts code, only text/toggles.
+///
+/// Edits are staged into PendingSettingsChanges.hookDraft rather than saved
+/// immediately — the plugin options are only read at engine launch, so
+/// nothing here takes effect until the settings window's "应用更改" commits
+/// the draft and restarts once.
+struct KimiHookSettingsPane: View {
+  @ObservedObject var pending: PendingSettingsChanges
 
   @State private var systemPromptRules: [String] = []
   @State private var newRuleText = ""
@@ -16,24 +19,23 @@ struct KimiHookSettingsView: View {
   @State private var webFetchAllowedDomainsText = ""
   @State private var toolOutputCharLimits: [String: Int] = [:]
   @State private var bashOutputLimitText = ""
-  @State private var errorMessage: String? = nil
-  @State private var isSaving = false
 
   private let store: KimiHookConfigStore
   private static let presetRules = ["总是用简体中文回复", "回复保持简洁，避免不必要的重复", "优先给出可执行的代码而不是纯文字建议"]
   private static let overridableTools = ["bash", "edit", "webfetch", "external_directory"]
 
-  init(model: KimiAppViewModel, isPresented: Binding<Bool>) {
-    self.model = model
-    self._isPresented = isPresented
+  init(pending: PendingSettingsChanges) {
+    self.pending = pending
     let support = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Application Support/Kimi Code Agent", isDirectory: true)
     self.store = KimiHookConfigStore(fileURL: support.appendingPathComponent("settings/hook-config.json"))
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 20) {
-      header
+    VStack(alignment: .leading, spacing: KimiSettingsLayout.sectionSpacing) {
+      Text("配置引擎的系统提示词追加、权限覆盖、网页访问范围与工具输出上限。这里不能上传代码，只能勾选和填参数。更改需要点击底部“应用更改”才会生效。")
+        .font(.subheadline)
+        .foregroundStyle(KimiDesign.muted)
       ScrollView {
         VStack(alignment: .leading, spacing: 22) {
           systemPromptSection
@@ -42,46 +44,9 @@ struct KimiHookSettingsView: View {
           toolOutputSection
         }
       }
-      .frame(maxHeight: 440)
-      if let errorMessage {
-        HStack(spacing: 6) {
-          Image(systemName: "exclamationmark.circle")
-          Text(errorMessage)
-        }
-        .font(.caption)
-        .foregroundStyle(.red)
-        .padding(10)
-        .background(Color.red.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-      }
-      HStack {
-        Button("关闭") { isPresented = false }
-          .buttonStyle(.bordered)
-        Spacer()
-        Button("保存并重启引擎") { saveAndRestart() }
-          .buttonStyle(.borderedProminent)
-          .tint(KimiDesign.primary)
-          .disabled(isSaving)
-      }
+      .frame(maxHeight: KimiSettingsLayout.maxScrollHeight)
     }
-    .padding(24)
-    .frame(width: 560)
     .task { load() }
-  }
-
-  private var header: some View {
-    VStack(alignment: .leading, spacing: 6) {
-      HStack(spacing: 10) {
-        Image(systemName: "slider.horizontal.below.rectangle")
-          .font(.title2)
-          .foregroundStyle(KimiDesign.primary)
-        Text("高级行为规则")
-          .font(.title2.weight(.semibold))
-      }
-      Text("配置引擎的系统提示词追加、权限覆盖、网页访问范围与工具输出上限。这里不能上传代码，只能勾选和填参数。")
-        .font(.subheadline)
-        .foregroundStyle(KimiDesign.muted)
-    }
   }
 
   // MARK: - System prompt rules
@@ -105,6 +70,7 @@ struct KimiHookSettingsView: View {
           Spacer()
           Button {
             systemPromptRules.removeAll { $0 == rule }
+            pushDraft()
           } label: {
             Image(systemName: "xmark.circle.fill")
           }
@@ -125,6 +91,7 @@ struct KimiHookSettingsView: View {
           guard !trimmed.isEmpty, !systemPromptRules.contains(trimmed) else { return }
           systemPromptRules.append(trimmed)
           newRuleText = ""
+          pushDraft()
         }
         .disabled(newRuleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
       }
@@ -144,6 +111,7 @@ struct KimiHookSettingsView: View {
         } else {
           systemPromptRules.removeAll { $0 == preset }
         }
+        pushDraft()
       }
     )
   }
@@ -186,6 +154,7 @@ struct KimiHookSettingsView: View {
       get: { permissionOverrides[toolID] },
       set: { newValue in
         if let newValue { permissionOverrides[toolID] = newValue } else { permissionOverrides.removeValue(forKey: toolID) }
+        pushDraft()
       }
     )
   }
@@ -198,7 +167,10 @@ struct KimiHookSettingsView: View {
       Text("每行一个域名（含子域名自动放行），留空表示不限制。webfetch 工具访问不在名单内的域名会被引擎拒绝。")
         .font(.caption)
         .foregroundStyle(KimiDesign.muted)
-      TextEditor(text: $webFetchAllowedDomainsText)
+      TextEditor(text: Binding(
+        get: { webFetchAllowedDomainsText },
+        set: { webFetchAllowedDomainsText = $0; pushDraft() }
+      ))
         .font(.caption.monospaced())
         .frame(height: 70)
         .padding(6)
@@ -218,27 +190,29 @@ struct KimiHookSettingsView: View {
       HStack {
         Text("bash").font(.caption.monospaced())
         Spacer()
-        TextField("例如 4000", text: $bashOutputLimitText)
+        TextField("例如 4000", text: Binding(
+          get: { bashOutputLimitText },
+          set: { bashOutputLimitText = $0; pushDraft() }
+        ))
           .textFieldStyle(.roundedBorder)
           .frame(width: 140)
       }
     }
   }
 
-  // MARK: - Load / Save
+  // MARK: - Load / draft
 
   private func load() {
-    guard let configuration = try? store.load() else { return }
+    let configuration = (try? store.load()) ?? KimiHookConfiguration()
     systemPromptRules = configuration.systemPromptRules
     permissionOverrides = configuration.permissionOverrides
     webFetchAllowedDomainsText = configuration.webFetchAllowedDomains.joined(separator: "\n")
     toolOutputCharLimits = configuration.toolOutputCharLimits
     bashOutputLimitText = configuration.toolOutputCharLimits["bash"].map(String.init) ?? ""
+    pending.setHookBaseline(configuration)
   }
 
-  private func saveAndRestart() {
-    isSaving = true
-    errorMessage = nil
+  private func pushDraft() {
     let domains = webFetchAllowedDomainsText
       .components(separatedBy: .newlines)
       .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -249,22 +223,11 @@ struct KimiHookSettingsView: View {
     } else {
       limits.removeValue(forKey: "bash")
     }
-    let configuration = KimiHookConfiguration(
+    pending.updateHookDraft(KimiHookConfiguration(
       systemPromptRules: systemPromptRules,
       permissionOverrides: permissionOverrides,
       webFetchAllowedDomains: domains,
       toolOutputCharLimits: limits
-    )
-    do {
-      try store.save(configuration)
-      Task {
-        try? await model.kernel.send(.restartRuntime)
-        await model.refresh()
-        await MainActor.run { isSaving = false }
-      }
-    } catch {
-      errorMessage = "保存失败：\(error.localizedDescription)"
-      isSaving = false
-    }
+    ))
   }
 }
