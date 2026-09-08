@@ -3,8 +3,14 @@
 
 cd "$(dirname "$0")"
 
-# 你的 Kimi API Key（从 https://platform.moonshot.cn/ 获取）
-export KIMI_API_KEY="sk-CU3evCnG8Ohf2lwY9yxjBpGlxHEs8BinIbj4XRf6k2Bd2mYX"
+# 从环境变量读取 Kimi API Key（从 https://platform.moonshot.cn/ 获取）。
+# 不要把真实 Key 写进本文件：它会被提交进 git。用法：
+#   KIMI_API_KEY="sk-..." ./run-app-with-config.sh
+if [ -z "$KIMI_API_KEY" ]; then
+  echo "错误：未设置 KIMI_API_KEY 环境变量"
+  echo "用法: KIMI_API_KEY=\"sk-...\" $0"
+  exit 1
+fi
 
 APP_PATH="release-native/Kimi Code Agent.app"
 EXEC_PATH="$APP_PATH/Contents/MacOS/KimiCodeAgent"
@@ -16,7 +22,6 @@ if [ ! -f "$EXEC_PATH" ]; then
 fi
 
 echo "启动 Kimi Code Agent..."
-echo "API Key: ${KIMI_API_KEY:0:20}..."
 echo "App 路径: $APP_PATH"
 
 # 直接执行 app 内的二进制文件（这样能继承环境变量）
