@@ -381,8 +381,16 @@ struct KimiSidebarView: View {
     }
     // Sort every level (roots and each parent's children) newest first, so
     // branch trees read the same top-to-bottom order as the old flat list.
+    // Sessions restored in the same pass can share the exact same
+    // `updatedAt` timestamp; `sorted(by:)` on a tied key is not guaranteed
+    // stable, so ties break on `id` to keep row order deterministic across
+    // re-renders instead of visibly swapping places.
     func sortRecursively(_ nodes: [SessionNode]) -> [SessionNode] {
-      let sorted = nodes.sorted { $0.session.updatedAt > $1.session.updatedAt }
+      let sorted = nodes.sorted {
+        $0.session.updatedAt != $1.session.updatedAt
+          ? $0.session.updatedAt > $1.session.updatedAt
+          : $0.session.id.uuidString > $1.session.id.uuidString
+      }
       for node in sorted {
         if let children = node.children {
           node.children = sortRecursively(children)

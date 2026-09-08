@@ -1131,7 +1131,16 @@ public actor KimiAppKernel {
     }
     // Restoring sessions must not auto-open one: the app launches into the
     // home dashboard and the user explicitly picks where to continue.
-    state.sessions.sort { $0.updatedAt > $1.updatedAt }
+    //
+    // Sessions created in the same restore pass share the exact same `.now`
+    // timestamp (set just above), so `updatedAt` alone is not a total order.
+    // Array.sort() is not guaranteed stable, so ties on that key can flip
+    // their relative order on every call — visible in the sidebar as rows
+    // swapping places each time the engine reconnects. `id` breaks ties
+    // deterministically so repeated restores stop reshuffling the list.
+    state.sessions.sort {
+      $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id.uuidString > $1.id.uuidString
+    }
   }
 
   private func watch(sessionID: String) async throws {
