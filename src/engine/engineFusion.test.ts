@@ -71,4 +71,30 @@ describe('Engine fusion profile', () => {
     expect(() => validateKimiEndpoint('http://api.moonshot.cn/v1')).toThrow('HTTPS');
     expect(() => validateKimiEndpoint('https://example.com/v1')).toThrow('Kimi');
   });
+
+  it('defaults small_model to the main model when no smallModelID is provided', () => {
+    const config = createKimiEngineConfig({ modelID: 'kimi-k2.7-code' });
+
+    expect(config.small_model).toBe('moonshotai-cn/kimi-k2.7-code');
+    expect(config.provider['moonshotai-cn'].models['kimi-k2.7-code']).toBeDefined();
+    expect(Object.keys(config.provider['moonshotai-cn'].models)).toEqual(['kimi-k2.7-code']);
+  });
+
+  it('routes small_model to a registered low-cost model when smallModelID is provided', () => {
+    const config = createKimiEngineConfig({ modelID: 'kimi-k2.7-code', smallModelID: 'kimi-k2-lite' });
+
+    expect(config.model).toBe('moonshotai-cn/kimi-k2.7-code');
+    expect(config.small_model).toBe('moonshotai-cn/kimi-k2-lite');
+    expect(config.provider['moonshotai-cn'].models['kimi-k2-lite']).toMatchObject({
+      reasoning: true,
+      tool_call: true
+    });
+  });
+
+  it('ignores a smallModelID that is blank or identical to the main model', () => {
+    expect(createKimiEngineConfig({ modelID: 'kimi-k2.7-code', smallModelID: '  ' }).small_model)
+      .toBe('moonshotai-cn/kimi-k2.7-code');
+    expect(createKimiEngineConfig({ modelID: 'kimi-k2.7-code', smallModelID: 'kimi-k2.7-code' }).small_model)
+      .toBe('moonshotai-cn/kimi-k2.7-code');
+  });
 });

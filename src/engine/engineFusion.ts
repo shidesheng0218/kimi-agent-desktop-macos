@@ -4,6 +4,7 @@ import path from 'node:path';
 export type KimiEngineProfileInput = {
   baseURL?: string;
   modelID: string;
+  smallModelID?: string;
 };
 
 export type KimiEngineConfig = {
@@ -82,11 +83,26 @@ export function validateKimiEndpoint(value: string = defaultBaseURL): string {
 export function createKimiEngineConfig(input: KimiEngineProfileInput): KimiEngineConfig {
   const modelID = input.modelID.trim();
   if (!modelID) throw new Error('Kimi 模型 ID 不能为空。');
+  // Optional low-cost route for lightweight engine tasks (title generation
+  // etc.); it must also be registered in the provider's models table or the
+  // engine rejects the small_model reference at validation time.
+  const smallModelOverride = input.smallModelID?.trim();
+  const smallModelID = smallModelOverride && smallModelOverride !== modelID ? smallModelOverride : undefined;
 
   const baseURL = validateKimiEndpoint(input.baseURL);
+  const modelEntry = (id: string) => ({
+    name: id,
+    reasoning: true,
+    tool_call: true,
+    interleaved: 'reasoning_content',
+    limit: { context: 262144, output: 16384 },
+    modalities: { input: ['text', 'image'], output: ['text'] }
+  });
+  const models: Record<string, Record<string, unknown>> = { [modelID]: modelEntry(modelID) };
+  if (smallModelID) models[smallModelID] = modelEntry(smallModelID);
   return {
     model: `moonshotai-cn/${modelID}`,
-    small_model: `moonshotai-cn/${modelID}`,
+    small_model: `moonshotai-cn/${smallModelID ?? modelID}`,
     plugin: ['{env:KIMI_RUNTIME_PLUGIN}'],
     provider: {
       'moonshotai-cn': {
@@ -102,16 +118,7 @@ export function createKimiEngineConfig(input: KimiEngineProfileInput): KimiEngin
           chunkTimeout: 30000,
           setCacheKey: true
         },
-        models: {
-          [modelID]: {
-            name: modelID,
-            reasoning: true,
-            tool_call: true,
-            interleaved: 'reasoning_content',
-            limit: { context: 262144, output: 16384 },
-            modalities: { input: ['text', 'image'], output: ['text'] }
-          }
-        }
+        models
       }
     },
     permission: {
