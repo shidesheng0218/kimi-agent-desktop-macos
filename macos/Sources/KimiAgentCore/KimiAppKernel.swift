@@ -40,7 +40,7 @@ public actor KimiRuntimeOperationDriver {
     await sink(.turnStarted(HarnessTurnRecord(turnID: turnID, modelID: modelID)))
     await sink(.stepStarted(HarnessStepRecord(turnID: turnID, step: 1)))
     let events = try await client.subscribeEvents(sessionID: sessionID, directory: directory)
-    try await client.prompt(KimiRuntimePromptInput(sessionID: sessionID, text: context.prompt.text, directory: directory, modelID: modelID))
+    try await client.prompt(KimiRuntimePromptInput(sessionID: sessionID, text: context.prompt.text, directory: directory, modelID: modelID, attachments: context.prompt.attachments, agent: context.prompt.agent))
     do {
       try await withThrowingTaskGroup(of: Void.self) { group in
         group.addTask { try await Self.waitForCompletion(events, timeout: self.completionTimeout) }
@@ -62,11 +62,19 @@ public actor KimiRuntimeOperationDriver {
   /// sent while the session is busy is admitted by the engine's loop on its
   /// next iteration, which provides the steer semantics the Harness queue
   /// was designed for but never delivered to.
+  ///
+  /// A failed steer delivery throws instead of being swallowed: the user
+  /// already sees their steering message in the timeline, so silently
+  /// dropping it would claim a delivery that never happened.
   private func pumpSteering(context: HarnessOperationContext, sessionID: String) async throws {
     while !Task.isCancelled {
       let steering = await context.takeSteering()
-      for input in steering where !input.text.isEmpty {
-        try? await client.prompt(KimiRuntimePromptInput(sessionID: sessionID, text: input.text, directory: directory, modelID: modelID))
+      for input in steering where !input.text.isEmpty || !input.attachments.isEmpty {
+        do {
+          try await client.prompt(KimiRuntimePromptInput(sessionID: sessionID, text: input.text, directory: directory, modelID: modelID, attachments: input.attachments, agent: input.agent))
+        } catch {
+          throw KimiRuntimeError.requestFailed("补充指令没有送达执行引擎：\(error.localizedDescription)")
+        }
       }
       try await Task.sleep(for: .milliseconds(300))
     }
@@ -111,6 +119,7 @@ public actor KimiAppKernel {
   private let stateStore: KimiAppStateStore?
   private let harnessStore: HarnessEventStore?
   private let activityStats: KimiActivityStatsStore?
+  private let usageLedger: UsageLedger?
   private let runtimeConfigurationProvider: (@Sendable (_ modelID: String, _ catalog: [String]) -> KimiRuntimeConfiguration?)?
   private let harnessSessionID: UUID
   private var state: KimiUIState
@@ -128,10 +137,22 @@ public actor KimiAppKernel {
   private var replyCountedThisTurn = false
   private var reasoningActivityByPart: [String: UUID] = [:]
   private var recordedAssistantTurns: Set<UUID> = []
+  /// Latest assistant `message.updated` usage per engine session, overwritten
+  /// as cumulative frames stream in and consumed once at turn settlement.
+  private var turnUsageBySession: [String: AssistantTurnUsage] = [:]
+  /// Turn start wall-clock per engine session, recorded when the prompt is
+  /// sent so the ledger entry carries a real latency figure.
+  private var turnStartedAtBySession: [String: Date] = [:]
+  /// 侧聊轮次的引擎消息 ID(message.updated 帧携带),用于派生确定性的账本
+  /// entryID——重连重放同一轮帧序列时命中 UsageLedger 的 id 去重。
+  private var turnMessageIDBySession: [String: String] = [:]
   /// Sessions the user deliberately aborted; the engine's resulting error
   /// frame is expected and must not surface as a red error banner.
   private var recentlyAbortedSessions: Set<String> = []
   private var lastTextPersistAt: Date = .distantPast
+  /// The most recent failed Harness operation, so the UI's retry button has
+  /// a concrete target without the view layer tracking operation IDs.
+  private var lastFailedOperationID: OperationID?
 
   public init(
     sessionClient: any EngineProvider = UnavailableKimiRuntimeSessionClient(),
@@ -140,6 +161,7 @@ public actor KimiAppKernel {
     persistence: KimiAppStateStore? = nil,
     harnessStore: HarnessEventStore? = nil,
     activityStats: KimiActivityStatsStore? = nil,
+    usageLedger: UsageLedger? = nil,
     runtimeConfigurationProvider: (@Sendable (_ modelID: String, _ catalog: [String]) -> KimiRuntimeConfiguration?)? = nil,
     modelCatalog: [String]? = nil
   ) {
@@ -148,6 +170,7 @@ public actor KimiAppKernel {
     self.stateStore = persistence
     self.harnessStore = harnessStore
     self.activityStats = activityStats
+    self.usageLedger = usageLedger
     self.runtimeConfigurationProvider = runtimeConfigurationProvider
     let restored = persistence.flatMap { try? $0.load() }
     let resolvedHarnessSessionID = restored?.harnessSessionID ?? sessionID
@@ -169,6 +192,34 @@ public actor KimiAppKernel {
       }
     }
     self.state = restoredState
+    // Surfaces asynchronous Harness failures (driver timeout, engine stream
+    // dying mid-turn, …) as a user-visible error. Without this the operation
+    // settles as `.failed` inside the Harness while the UI keeps showing a
+    // turn that simply never answers. Fire-and-forget: the loop exits when
+    // the kernel deallocates (weak self), and the kernel lives for the app's
+    // lifetime.
+    let observedHarness = self.harness
+    Task { [weak self] in
+      for await event in await observedHarness.events() {
+        guard let self else { return }
+        await self.handleHarnessEvent(event)
+      }
+    }
+  }
+
+  private func handleHarnessEvent(_ event: HarnessEvent) {
+    guard event.kind == .operationStateChanged,
+          let payload = event.payload,
+          let operation = try? JSONDecoder().decode(HarnessOperation.self, from: payload) else { return }
+    if operation.state == .failed {
+      lastFailedOperationID = operation.id
+      let message = operation.errorMessage ?? "任务执行失败。"
+      state.lastError = message
+      publish(.error(message))
+      persistState()
+    } else if operation.state == .completed, operation.id == lastFailedOperationID {
+      lastFailedOperationID = nil
+    }
   }
 
   public func snapshot() -> KimiUIState {
@@ -243,6 +294,7 @@ public actor KimiAppKernel {
       state.runtimeState = .ready
       state.lastError = nil
       publish(.runtimeChanged(.ready))
+      await cleanupOrphanSideChats()
       await restoreRuntimeSessions()
       await rewatchAllSessions()
       if let activeID = state.activeSessionID,
@@ -265,53 +317,93 @@ public actor KimiAppKernel {
   public func send(_ command: KimiAppCommand) async throws {
     switch command {
     case let .createSession(directory):
-      let resolvedDirectory = directory ?? state.recentProjects.first
-      let session = try await sessionClient.createSession(CreateSessionInput(directory: resolvedDirectory))
-      let summary = KimiSessionSummary(id: UUID(), runtimeID: session.id, title: session.title ?? "新会话", projectPath: session.directory ?? resolvedDirectory)
-      state.sessions.insert(summary, at: 0)
-      state.activeSessionID = summary.id
-      state.messages.removeAll()
-      state.activities.removeAll()
-      state.todos.removeAll()
-      state.todosSessionID = nil
-      recordRecentProject(summary.projectPath)
-      await activityStats?.record(KimiActivityRecord(kind: .sessionCreated, project: summary.projectPath))
-      try await watch(sessionID: session.id)
-      publish(.sessionChanged(summary))
+      do {
+        let resolvedDirectory = directory ?? state.recentProjects.first
+        // 独立工作区:git 仓库项目在 <repo>/.kimi/worktrees/<id> 创建
+        // worktree,会话绑定到 worktree 目录;非 git 项目静默回退项目根,
+        // git 失败时回退并在会话里注明。引擎 worktree 端点
+        // (/experimental/worktree)未采用:它把 worktree 放在引擎全局数据
+        // 目录、分支固定 opencode/<name> 且异步填充,不满足 .kimi 前缀
+        // + 会话分支徽标 + 立即可绑定的要求。
+        let localID = UUID()
+        let (worktree, worktreeNote) = await resolveNewSessionWorktree(directory: resolvedDirectory, sessionID: localID)
+        let session = try await sessionClient.createSession(CreateSessionInput(directory: worktree?.path.path ?? resolvedDirectory))
+        let summary = KimiSessionSummary(
+          id: localID,
+          runtimeID: session.id,
+          title: session.title ?? "新会话",
+          projectPath: resolvedDirectory,
+          worktreePath: worktree?.path.path,
+          worktreeBranch: worktree?.branch
+        )
+        state.sessions.insert(summary, at: 0)
+        state.activeSessionID = summary.id
+        state.messages.removeAll()
+        state.activities.removeAll()
+        state.todos.removeAll()
+        state.todosSessionID = nil
+        if let worktreeNote {
+          state.messages.append(KimiMessage(role: .system, text: worktreeNote))
+        }
+        recordRecentProject(summary.projectPath)
+        await activityStats?.record(KimiActivityRecord(kind: .sessionCreated, project: summary.workingPath))
+        try await watch(sessionID: session.id)
+        publish(.sessionChanged(summary))
+        state.lastError = nil
+      } catch {
+        let message = "创建会话失败：\(error.localizedDescription)"
+        state.lastError = message
+        publish(.error(message))
+        persistState()
+        throw error
+      }
 
     case .createScratchSession:
-      let scratchDirectory = try resolveScratchDirectory()
-      let session = try await sessionClient.createSession(CreateSessionInput(directory: scratchDirectory.path, title: "临时对话"))
-      let summary = KimiSessionSummary(
-        id: UUID(),
-        runtimeID: session.id,
-        title: session.title ?? "临时对话",
-        projectPath: session.directory ?? scratchDirectory.path,
-        isScratch: true
-      )
-      state.sessions.insert(summary, at: 0)
-      state.activeSessionID = summary.id
-      state.messages.removeAll()
-      state.activities.removeAll()
-      state.todos.removeAll()
-      state.todosSessionID = nil
-      // Deliberately no recordRecentProject: the scratch directory must
-      // never surface as a suggested folder for real project sessions.
-      await activityStats?.record(KimiActivityRecord(kind: .sessionCreated, project: summary.projectPath))
-      try await watch(sessionID: session.id)
-      publish(.sessionChanged(summary))
+      do {
+        let scratchDirectory = try resolveScratchDirectory()
+        let session = try await sessionClient.createSession(CreateSessionInput(directory: scratchDirectory.path, title: "临时对话"))
+        let summary = KimiSessionSummary(
+          id: UUID(),
+          runtimeID: session.id,
+          title: session.title ?? "临时对话",
+          projectPath: session.directory ?? scratchDirectory.path,
+          isScratch: true
+        )
+        state.sessions.insert(summary, at: 0)
+        state.activeSessionID = summary.id
+        state.messages.removeAll()
+        state.activities.removeAll()
+        state.todos.removeAll()
+        state.todosSessionID = nil
+        // Deliberately no recordRecentProject: the scratch directory must
+        // never surface as a suggested folder for real project sessions.
+        await activityStats?.record(KimiActivityRecord(kind: .sessionCreated, project: summary.projectPath))
+        try await watch(sessionID: session.id)
+        publish(.sessionChanged(summary))
+        state.lastError = nil
+      } catch {
+        let message = "创建会话失败：\(error.localizedDescription)"
+        state.lastError = message
+        publish(.error(message))
+        persistState()
+        throw error
+      }
 
     case let .forkSession(id, messageID):
       guard let source = state.sessions.first(where: { $0.id == id }), let sourceRuntimeID = source.runtimeID else {
         throw KimiRuntimeError.notRunning
       }
-      let forked = try await sessionClient.forkSession(sessionID: sourceRuntimeID, messageID: messageID, directory: source.projectPath)
+      let forked = try await sessionClient.forkSession(sessionID: sourceRuntimeID, messageID: messageID, directory: source.workingPath)
       let summary = KimiSessionSummary(
         id: UUID(),
         runtimeID: forked.id,
         title: forked.title ?? "\(source.title) 分支",
-        projectPath: forked.directory ?? source.projectPath,
-        parentRuntimeID: forked.parentID ?? sourceRuntimeID
+        // fork 与源会话在同一目录工作:继承项目根与 worktree 绑定,
+        // 不取引擎返回的 directory(那是 worktree 路径,会破坏侧栏分组)。
+        projectPath: source.projectPath,
+        parentRuntimeID: forked.parentID ?? sourceRuntimeID,
+        worktreePath: source.worktreePath,
+        worktreeBranch: source.worktreeBranch
       )
       state.sessions.insert(summary, at: 0)
       state.activeSessionID = summary.id
@@ -344,18 +436,45 @@ public actor KimiAppKernel {
       state.todosSessionID = nil
 
     case let .prompt(input):
-      let session = try await ensureActiveSession()
-      await operationDriver.setSession(session.id, directory: session.directory)
-      await operationDriver.setModel(state.selectedModel)
-      state.messages.append(KimiMessage(role: .user, text: input.text))
-      publish(.userText(input.text))
-      replyCountedThisTurn = false
-      await activityStats?.record(KimiActivityRecord(kind: .promptSent, project: session.directory))
-      let operationID = try await harness.prompt(input)
-      operationSessions[operationID] = session.id
-      sessionOperations[session.id] = operationID
-      state.runtimeState = .ready
-      state.lastError = nil
+      do {
+        let session = try await ensureActiveSession()
+        await syncSessionPermissionRules(sessionID: session.id, directory: session.directory)
+        await operationDriver.setSession(session.id, directory: session.directory)
+        await operationDriver.setModel(state.selectedModel)
+        state.messages.append(KimiMessage(role: .user, text: input.text, attachments: input.attachments))
+        publish(.userText(input.text))
+        replyCountedThisTurn = false
+        await activityStats?.record(KimiActivityRecord(kind: .promptSent, project: session.directory))
+        // Opt-in cost ceiling: only active when KIMI_AGENT_BUDGET_USD parses
+        // as a positive Decimal and a usage ledger is attached. A .warning
+        // verdict still passes; only .exceeded blocks the turn.
+        if let usageLedger,
+           let rawBudget = ProcessInfo.processInfo.environment["KIMI_AGENT_BUDGET_USD"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let budget = Decimal(string: rawBudget), budget > 0 {
+          let spent = usageLedger.totalCost()
+          if CostBudgetGate.decision(spent: spent, budget: budget) == .exceeded {
+            throw KimiRuntimeError.requestFailed("已超出成本预算：累计已花费 $\(spent)，预算上限 $\(budget)（KIMI_AGENT_BUDGET_USD）。本轮未发送，请调整预算或稍后重试。")
+          }
+        }
+        turnStartedAtBySession[session.id] = .now
+        let operationID = try await harness.prompt(input)
+        operationSessions[operationID] = session.id
+        sessionOperations[session.id] = operationID
+        state.runtimeState = .ready
+        state.lastError = nil
+      } catch {
+        // The turn never reached the engine: drop the sent-looking bubble so
+        // the timeline stays truthful, surface the failure, and rethrow so
+        // the view layer can restore the composer text.
+        if state.messages.last?.role == .user, state.messages.last?.text == input.text {
+          state.messages.removeLast()
+        }
+        let message = "发送失败：\(error.localizedDescription)"
+        state.lastError = message
+        publish(.error(message))
+        persistState()
+        throw error
+      }
 
     case let .steer(input):
       let laneBusy = await harness.snapshot().lanes[.main]?.activeOperation != nil
@@ -365,11 +484,23 @@ public actor KimiAppKernel {
         try await send(.prompt(input))
         return
       }
-      let session = try await ensureActiveSession()
-      await operationDriver.setSession(session.id, directory: session.directory)
-      state.messages.append(KimiMessage(role: .user, text: input.text))
-      publish(.userText(input.text))
-      try await harness.steer(input, lane: .main)
+      do {
+        let session = try await ensureActiveSession()
+        await syncSessionPermissionRules(sessionID: session.id, directory: session.directory)
+        await operationDriver.setSession(session.id, directory: session.directory)
+        state.messages.append(KimiMessage(role: .user, text: input.text, attachments: input.attachments))
+        publish(.userText(input.text))
+        try await harness.steer(input, lane: .main)
+      } catch {
+        if state.messages.last?.role == .user, state.messages.last?.text == input.text {
+          state.messages.removeLast()
+        }
+        let message = "补充指令没有送达：\(error.localizedDescription)"
+        state.lastError = message
+        publish(.error(message))
+        persistState()
+        throw error
+      }
 
     case let .followUp(input):
       let laneBusy = await harness.snapshot().lanes[.main]?.activeOperation != nil
@@ -377,11 +508,22 @@ public actor KimiAppKernel {
         try await send(.prompt(input))
         return
       }
-      let session = try await ensureActiveSession()
-      await operationDriver.setSession(session.id, directory: session.directory)
-      state.messages.append(KimiMessage(role: .user, text: input.text))
-      publish(.userText(input.text))
-      try await harness.followUp(input, lane: .main)
+      do {
+        let session = try await ensureActiveSession()
+        await operationDriver.setSession(session.id, directory: session.directory)
+        state.messages.append(KimiMessage(role: .user, text: input.text, attachments: input.attachments))
+        publish(.userText(input.text))
+        try await harness.followUp(input, lane: .main)
+      } catch {
+        if state.messages.last?.role == .user, state.messages.last?.text == input.text {
+          state.messages.removeLast()
+        }
+        let message = "排队指令没有送达：\(error.localizedDescription)"
+        state.lastError = message
+        publish(.error(message))
+        persistState()
+        throw error
+      }
 
     case let .abort(operationID):
       if let sessionID = operationSessions[operationID] {
@@ -464,8 +606,19 @@ public actor KimiAppKernel {
         publish(.error(state.lastError ?? "压缩上下文失败。"))
       }
 
-    case .retry:
-      state.lastError = nil
+    case let .retry(operationID):
+      // Retry used to be a no-op that only cleared the error banner. Resend
+      // the failed operation's stored prompt through the normal prompt path
+      // so a failed turn is actually recoverable.
+      let harnessSnapshot = await harness.snapshot()
+      guard let operation = harnessSnapshot.operations[operationID],
+            operation.state == .failed,
+            let prompt = operation.prompt else {
+        state.lastError = "没有可重试的失败任务。"
+        publish(.error(state.lastError ?? "没有可重试的失败任务。"))
+        break
+      }
+      try await send(.prompt(prompt))
 
     case .resume:
       try await harness.resume(.main)
@@ -481,6 +634,11 @@ public actor KimiAppKernel {
 
     case .openFile:
       state.activePane = .files
+
+    case let .openAuxPane(pane):
+      // 仅限纯本地投影面板与返回会话;diff/browser/files 各有专用命令。
+      guard pane == .conversation || pane == .verification || pane == .integrations || pane == .tasks else { break }
+      state.activePane = pane
 
     case let .changeModel(model):
       let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -517,18 +675,151 @@ public actor KimiAppKernel {
       state.thinkingEffort = trimmed
       persistState()
 
+    case let .deleteSession(id):
+      guard let index = state.sessions.firstIndex(where: { $0.id == id }) else { break }
+      let summary = state.sessions[index]
+      if let runtimeID = summary.runtimeID {
+        try? await sessionClient.deleteSession(sessionID: runtimeID, directory: summary.workingPath)
+        eventTasks[runtimeID]?.cancel()
+        eventTasks.removeValue(forKey: runtimeID)
+        eventTaskTokens.removeValue(forKey: runtimeID)
+        sessionOperations.removeValue(forKey: runtimeID)
+        state.lastUserMessageIDBySession.removeValue(forKey: runtimeID)
+        state.revertedSessionIDs.removeAll { $0 == runtimeID }
+        state.busySessionIDs.removeAll { $0 == runtimeID }
+      }
+      state.sessions.remove(at: index)
+      if state.activeSessionID == id {
+        state.activeSessionID = nil
+        state.messages.removeAll()
+        state.activities.removeAll()
+        state.todos.removeAll()
+        state.todosSessionID = nil
+      }
+
+    case .openSideChat:
+      // 侧聊 = 主会话的临时 fork:引擎侧复制完整历史,天然“能读到主会话
+      // 上下文但不写入主会话”。不走 prompt_async 的 noReply(它只是不回
+      // 复的单向写入)或消息摘要注入(fork 已带全量上下文,注入摘要只会
+      // 更差)。临时会话不进 state.sessions,侧栏无感。
+      guard state.sideChat == nil,
+            let activeID = state.activeSessionID,
+            let session = state.sessions.first(where: { $0.id == activeID }) else { break }
+      let runtimeID = session.runtimeID ?? session.id.uuidString
+      do {
+        let forked = try await sessionClient.forkSession(sessionID: runtimeID, messageID: nil, directory: session.workingPath)
+        state.sideChat = KimiSideChatState(
+          sessionRuntimeID: forked.id,
+          parentRuntimeID: runtimeID,
+          directory: session.workingPath
+        )
+        if !state.sideChatRuntimeIDs.contains(forked.id) {
+          state.sideChatRuntimeIDs.append(forked.id)
+        }
+        try await watch(sessionID: forked.id)
+        publish(.sideChatUpdated)
+        state.lastError = nil
+      } catch {
+        state.lastError = "打开侧聊失败：\(error.localizedDescription)"
+        publish(.error(state.lastError ?? "打开侧聊失败。"))
+      }
+
+    case .closeSideChat:
+      guard let sideChat = state.sideChat else { break }
+      eventTasks[sideChat.sessionRuntimeID]?.cancel()
+      eventTasks.removeValue(forKey: sideChat.sessionRuntimeID)
+      eventTaskTokens.removeValue(forKey: sideChat.sessionRuntimeID)
+      turnUsageBySession.removeValue(forKey: sideChat.sessionRuntimeID)
+      turnStartedAtBySession.removeValue(forKey: sideChat.sessionRuntimeID)
+      turnMessageIDBySession.removeValue(forKey: sideChat.sessionRuntimeID)
+      state.sideChat = nil
+      state.pendingPermissions.removeAll { $0.sessionRuntimeID == sideChat.sessionRuntimeID }
+      state.sideChatRuntimeIDs.removeAll { $0 == sideChat.sessionRuntimeID }
+      // 临时会话用完即删;失败则留在 sideChatRuntimeIDs 里,下次启动时
+      // cleanupOrphanSideChats 重试。
+      if (try? await sessionClient.deleteSession(sessionID: sideChat.sessionRuntimeID, directory: sideChat.directory)) == nil {
+        state.sideChatRuntimeIDs.append(sideChat.sessionRuntimeID)
+      }
+      publish(.sideChatUpdated)
+
+    case let .sideChatPrompt(text):
+      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty, var sideChat = state.sideChat else { break }
+      sideChat.messages.append(KimiMessage(role: .user, text: trimmed))
+      sideChat.error = nil
+      state.sideChat = sideChat
+      publish(.sideChatUpdated)
+      do {
+        try await sessionClient.prompt(KimiRuntimePromptInput(
+          sessionID: sideChat.sessionRuntimeID,
+          text: trimmed,
+          directory: sideChat.directory,
+          modelID: state.selectedModel,
+          agent: permissionMode.promptAgent
+        ))
+        // 与主通道一致:prompt 送达时记下轮次起点,结算时写真实时延。
+        turnStartedAtBySession[sideChat.sessionRuntimeID] = .now
+        state.sideChat?.busy = true
+        publish(.sideChatUpdated)
+      } catch {
+        // 与主通道一致:送达失败的乐观气泡要撤回,输入交还给用户重发。
+        if state.sideChat?.messages.last?.role == .user, state.sideChat?.messages.last?.text == trimmed {
+          state.sideChat?.messages.removeLast()
+        }
+        state.sideChat?.error = "侧聊发送失败：\(error.localizedDescription)"
+        publish(.sideChatUpdated)
+      }
+
+    case .sideChatAbort:
+      guard let sideChat = state.sideChat else { break }
+      try? await sessionClient.abort(sessionID: sideChat.sessionRuntimeID, directory: sideChat.directory)
+      state.sideChat?.busy = false
+      publish(.sideChatUpdated)
+
     case .restartRuntime:
-      if let runtimeSupervisor {
+      // Without a supervisor (engine not bundled) there is nothing to
+      // restart; reporting ready here would lie about the runtime state.
+      guard let runtimeSupervisor else {
+        state.runtimeState = .failed
+        state.lastError = "后台执行引擎尚未打包或未配置，无法重启。"
+        publish(.runtimeChanged(.failed))
+        publish(.error(state.lastError ?? "后台执行引擎尚未连接。"))
+        persistState()
+        break
+      }
+      do {
         _ = try await runtimeSupervisor.restart()
         try await runtimeSupervisor.waitUntilReady()
+        state.runtimeState = .ready
+        state.lastError = nil
+        publish(.runtimeChanged(.ready))
+        await restoreRuntimeSessions()
+        await rewatchAllSessions()
+      } catch {
+        state.runtimeState = .failed
+        state.lastError = "重启执行引擎失败：\(error.localizedDescription)"
+        publish(.runtimeChanged(.failed))
+        publish(.error(state.lastError ?? "重启执行引擎失败。"))
       }
-      state.runtimeState = .ready
-      state.lastError = nil
-      publish(.runtimeChanged(.ready))
-      await restoreRuntimeSessions()
-      await rewatchAllSessions()
     }
     persistState()
+  }
+
+  /// Retries the most recent failed Harness operation, if it is still in a
+  /// failed state. Backs the error banner's retry button so the view layer
+  /// never has to track operation IDs.
+  public func retryLastFailure() async {
+    guard let operationID = lastFailedOperationID else { return }
+    let harnessSnapshot = await harness.snapshot()
+    guard harnessSnapshot.operations[operationID]?.state == .failed else { return }
+    try? await send(.retry(operationID))
+  }
+
+  /// Accumulated token/cost for one runtime session, read from the usage
+  /// ledger. Nil when no ledger is attached or nothing has been settled for
+  /// the session yet.
+  public func sessionUsage(sessionID: String) -> (tokens: Int, cost: Decimal)? {
+    usageLedger?.sessionUsage(sessionID: sessionID)
   }
 
   /// Interrupts the turn running in the visible session. Works even when the
@@ -550,21 +841,80 @@ public actor KimiAppKernel {
     persistState()
   }
 
+  /// 新会话的独立工作区解析:设置开启且目录是有 HEAD 的 git 仓库时创建
+  /// .kimi/worktrees/<id> worktree;非 git 项目静默返回 nil,git 失败返回
+  /// nil 并附注明文案。git 子进程全部在 detached 任务里执行。
+  private func resolveNewSessionWorktree(directory: String?, sessionID: UUID) async -> (worktree: GitWorktree?, note: String?) {
+    guard worktreeIsolationEnabled, let directory else { return (nil, nil) }
+    let root = URL(fileURLWithPath: directory, isDirectory: true)
+    guard await GitWorktreeManager.canCreateSessionWorktree(root) else { return (nil, nil) }
+    do {
+      return (try await GitWorktreeManager.createSessionWorktree(projectRoot: root, sessionID: sessionID), nil)
+    } catch {
+      return (nil, "无法创建独立工作区（\(error.localizedDescription)），本次会话直接在项目目录运行。")
+    }
+  }
+
   private func ensureActiveSession() async throws -> KimiRuntimeSession {
     if let activeID = state.activeSessionID,
        let existing = state.sessions.first(where: { $0.id == activeID }) {
-      return KimiRuntimeSession(id: existing.runtimeID ?? existing.id.uuidString, title: existing.title, directory: existing.projectPath)
+      return KimiRuntimeSession(id: existing.runtimeID ?? existing.id.uuidString, title: existing.title, directory: existing.workingPath)
     }
     guard let directory = state.recentProjects.first else {
       throw KimiRuntimeError.requestFailed("请先选择项目文件夹，再开始任务。")
     }
-    let created = try await sessionClient.createSession(CreateSessionInput(directory: directory))
-    let summary = KimiSessionSummary(id: UUID(), runtimeID: created.id, title: created.title ?? "新会话", projectPath: created.directory ?? directory)
+    // 隐式建会话(无会话直接发消息)与 ⌘N 走同一条 worktree 隔离路径。
+    let localID = UUID()
+    let (worktree, worktreeNote) = await resolveNewSessionWorktree(directory: directory, sessionID: localID)
+    let created = try await sessionClient.createSession(CreateSessionInput(directory: worktree?.path.path ?? directory))
+    let summary = KimiSessionSummary(
+      id: localID,
+      runtimeID: created.id,
+      title: created.title ?? "新会话",
+      projectPath: directory,
+      worktreePath: worktree?.path.path,
+      worktreeBranch: worktree?.branch
+    )
     state.sessions.insert(summary, at: 0)
     state.activeSessionID = summary.id
+    if let worktreeNote {
+      state.messages.append(KimiMessage(role: .system, text: worktreeNote))
+    }
     recordRecentProject(summary.projectPath)
     try await watch(sessionID: created.id)
     return created
+  }
+
+  // MARK: - 权限模式
+
+  /// 当前权限模式（ViewModel 持久化在 UserDefaults，启动时回放到这里）。
+  /// plan 模式的 agent 切换由 ViewModel 经 PromptInput.agent 携带；这里只
+  /// 负责会话级 edit 规则的运行时 PATCH。
+  private var permissionMode: KimiSessionPermissionMode = .manual
+
+  /// 新会话是否绑定独立 git worktree(ViewModel 持久化在 UserDefaults,
+  /// 启动时与拨动开关时回放到这里)。非 git 项目/git 失败自动回退项目根。
+  private var worktreeIsolationEnabled = true
+
+  public func setWorktreeIsolationEnabled(_ enabled: Bool) {
+    worktreeIsolationEnabled = enabled
+  }
+
+  public func setPermissionMode(_ mode: KimiSessionPermissionMode) async {
+    permissionMode = mode
+    if let activeID = state.activeSessionID,
+       let session = state.sessions.first(where: { $0.id == activeID }) {
+      let runtimeID = session.runtimeID ?? session.id.uuidString
+      await syncSessionPermissionRules(sessionID: runtimeID, directory: session.workingPath)
+    }
+  }
+
+  /// 会话级 permission ruleset 运行时下发。引擎 Permission.evaluate 取最后
+  /// 命中，会话规则覆盖配置级 ask；best-effort —— 失败只意味着回落到引擎
+  /// 默认询问行为，不阻断发送。每条 prompt 前同步一次（loopback 开销可忽略），
+  /// 这样会话切换、引擎重启后状态也不会漂移。
+  private func syncSessionPermissionRules(sessionID: String, directory: String?) async {
+    try? await sessionClient.updateSessionPermission(sessionID: sessionID, ruleset: permissionMode.sessionPermissionRules, directory: directory)
   }
 
   private func recordRecentProject(_ path: String?) {
@@ -595,14 +945,40 @@ public actor KimiAppKernel {
   private func loadHistory(sessionID: String) async {
     guard let history = try? await sessionClient.fetchMessages(sessionID: sessionID, directory: directoryForSession(sessionID)),
           !history.isEmpty else { return }
+    let projected = Self.projectHistory(history)
+    state.messages = projected.messages
+    state.activities = projected.activities
+    state.lastUserMessageIDBySession[sessionID] = history.last(where: { $0.role == "user" })?.id
+    if let todos = try? await sessionClient.fetchTodos(sessionID: sessionID, directory: directoryForSession(sessionID)) {
+      state.todos = todos
+      state.todosSessionID = sessionID
+    }
+  }
+
+  /// loadHistory 的纯函数部分:把引擎持久消息日志投影成 消息 + 活动 两条
+  /// 时间线。活跃会话(loadHistory)与双会话分屏的次会话列(sessionHistory)
+  /// 共用同一份映射,保证两侧渲染一致。
+  private static func projectHistory(_ history: [KimiRuntimeHistoryMessage]) -> (messages: [KimiMessage], activities: [KimiActivity]) {
     var messages: [KimiMessage] = []
     var activities: [KimiActivity] = []
     for message in history {
       let createdAt = message.createdAt ?? .now
       if message.role == "user" {
-        let text = message.parts.filter { $0.type == "text" }.compactMap(\.text).joined(separator: "\n")
-        if !text.isEmpty {
-          messages.append(KimiMessage(role: .user, text: text, runtimeMessageID: message.id, createdAt: createdAt))
+        // 合成文本（file part 触发的 "Called the Read tool..." 与文件内容）
+        // 不属于用户输入，重建气泡时排除；file part 本身还原为附件 chip。
+        let text = message.parts.filter { $0.type == "text" && !$0.synthetic }.compactMap(\.text).joined(separator: "\n")
+        let attachments = message.parts
+          .filter { $0.type == "file" }
+          .map { part in
+            KimiPromptAttachment(
+              filename: part.filename ?? "附件",
+              mime: part.mime ?? "application/octet-stream",
+              url: part.url ?? "",
+              byteCount: 0
+            )
+          }
+        if !text.isEmpty || !attachments.isEmpty {
+          messages.append(KimiMessage(role: .user, text: text, runtimeMessageID: message.id, attachments: attachments, createdAt: createdAt))
         }
         continue
       }
@@ -627,13 +1003,62 @@ public actor KimiAppKernel {
         }
       }
     }
-    state.messages = messages
-    state.activities = activities
-    state.lastUserMessageIDBySession[sessionID] = history.last(where: { $0.role == "user" })?.id
-    if let todos = try? await sessionClient.fetchTodos(sessionID: sessionID, directory: directoryForSession(sessionID)) {
-      state.todos = todos
-      state.todosSessionID = sessionID
+    return (messages, activities)
+  }
+
+  /// 双会话分屏的次会话列数据源:只读引擎持久历史,不触碰活跃会话投影。
+  /// 返回空数组表示该会话暂无历史(与 loadHistory 的"空则不动"不同,
+  /// 次会话列需要显式清空)。
+  public func sessionHistory(sessionID runtimeID: String) async -> (messages: [KimiMessage], activities: [KimiActivity]) {
+    guard let history = try? await sessionClient.fetchMessages(sessionID: runtimeID, directory: directoryForSession(runtimeID)) else {
+      return ([], [])
     }
+    return Self.projectHistory(history)
+  }
+
+  /// 分屏次会话的发送通道:绕开 Harness 主通道(Harness 车道绑定活跃会话,
+  /// 切换会打断主会话),与侧聊同款走引擎直连 prompt。忙碌/权限/文本事件
+  /// 经该会话的 watch 流按 sessionID 回流(busy 进全局 busySessionIDs,
+  /// 文本走 .sessionEvent 直通)。
+  public func promptSession(_ sessionID: UUID, input: PromptInput) async throws {
+    guard let session = state.sessions.first(where: { $0.id == sessionID }) else {
+      throw KimiRuntimeError.requestFailed("会话不存在或已删除。")
+    }
+    let runtimeID = session.runtimeID ?? session.id.uuidString
+    await syncSessionPermissionRules(sessionID: runtimeID, directory: session.workingPath)
+    try await sessionClient.prompt(KimiRuntimePromptInput(
+      sessionID: runtimeID,
+      text: input.text,
+      directory: session.workingPath,
+      modelID: state.selectedModel,
+      attachments: input.attachments,
+      agent: input.agent
+    ))
+  }
+
+  /// 分屏次会话的斜杠命令通道:与 .runSlashCommand 同构,但按显式会话 ID
+  /// 路由,不触碰活跃会话投影(主通道经 ensureActiveSession 绑定活跃会话)。
+  public func runSessionSlashCommand(_ sessionID: UUID, name: String, arguments: String) async throws {
+    guard let session = state.sessions.first(where: { $0.id == sessionID }) else {
+      throw KimiRuntimeError.requestFailed("会话不存在或已删除。")
+    }
+    let runtimeID = session.runtimeID ?? session.id.uuidString
+    try await sessionClient.runCommand(sessionID: runtimeID, command: name, arguments: arguments, directory: session.workingPath)
+  }
+
+  /// 中断指定会话(分屏次会话列的「停止」)。与 abortActiveSession 同构,
+  /// 只是按显式会话 ID 定位。
+  public func abortSession(_ sessionID: UUID) async {
+    guard let session = state.sessions.first(where: { $0.id == sessionID }) else { return }
+    let runtimeID = session.runtimeID ?? session.id.uuidString
+    recentlyAbortedSessions.insert(runtimeID)
+    try? await sessionClient.abort(sessionID: runtimeID, directory: directoryForSession(runtimeID))
+    if let operationID = sessionOperations[runtimeID] {
+      await harness.abort(operationID)
+    }
+    apply(.sessionBusy(sessionID: runtimeID, isBusy: false))
+    publish(.sessionBusy(sessionID: runtimeID, isBusy: false))
+    persistState()
   }
 
   /// Pulls the model catalog from the engine's provider listing. When the
@@ -669,12 +1094,32 @@ public actor KimiAppKernel {
     persistState()
   }
 
+  /// 侧聊临时会话不持久化在 UI 里,但引擎侧会话是持久的:应用退出时若
+  /// 来不及 DELETE,启动时按 sideChatRuntimeIDs 兜底删除,best-effort。
+  private func cleanupOrphanSideChats() async {
+    let orphans = state.sideChatRuntimeIDs
+    guard !orphans.isEmpty else { return }
+    var survivors: [String] = []
+    for runtimeID in orphans {
+      if (try? await sessionClient.deleteSession(sessionID: runtimeID, directory: nil)) == nil {
+        survivors.append(runtimeID)
+      }
+    }
+    state.sideChatRuntimeIDs = survivors
+  }
+
   private func restoreRuntimeSessions() async {
     guard let sessions = try? await sessionClient.listSessions(directory: nil) else { return }
     for session in sessions {
+      // 侧聊临时会话不进侧栏;启动时的清理若已删掉它们,这里也见不到。
+      if state.sideChatRuntimeIDs.contains(session.id) { continue }
       if let index = state.sessions.firstIndex(where: { $0.runtimeID == session.id }) {
         state.sessions[index].title = session.title ?? state.sessions[index].title
-        state.sessions[index].projectPath = session.directory ?? state.sessions[index].projectPath
+        // worktree 会话的引擎 directory 是 worktree 路径;projectPath 必须
+        // 保持项目根(侧栏分组/最近项目/PR 监控),不能被引擎值覆盖。
+        if state.sessions[index].worktreePath == nil {
+          state.sessions[index].projectPath = session.directory ?? state.sessions[index].projectPath
+        }
         state.sessions[index].updatedAt = .now
       } else {
         state.sessions.append(KimiSessionSummary(
@@ -797,10 +1242,68 @@ public actor KimiAppKernel {
   }
 
   private func directoryForSession(_ runtimeID: String) -> String? {
-    state.sessions.first(where: { $0.runtimeID == runtimeID })?.projectPath
+    state.sessions.first(where: { $0.runtimeID == runtimeID })?.workingPath
+  }
+
+  /// 侧聊会话的事件路由:不进主会话时间线(state.messages/activities),
+  /// 只更新 state.sideChat 并发刷新信号。权限/问答请求仍走主通道
+  /// (pendingPermissions/pendingQuestions),由侧聊面板按 session 过滤展示。
+  private func ingestSideChat(_ event: EngineRuntimeEvent) async {
+    guard var sideChat = state.sideChat, sideChat.sessionRuntimeID == event.sessionID else { return }
+    switch event.kind {
+    case .assistantText:
+      if let text = event.text, !text.isEmpty {
+        if let partID = event.partID,
+           let index = sideChat.messages.lastIndex(where: { $0.role == .assistant && $0.runtimePartID == partID }) {
+          sideChat.messages[index].text = event.isSnapshot ? text : sideChat.messages[index].text + text
+          sideChat.messages[index].isStreaming = true
+        } else {
+          sideChat.messages.append(KimiMessage(role: .assistant, text: text, isStreaming: true, runtimePartID: event.partID))
+        }
+      }
+    case .sessionStatus:
+      sideChat.busy = event.payload["statusType"] != "idle"
+      if !sideChat.busy {
+        sealSideChatStreams(&sideChat)
+        settleSideChatTurnUsage(event, parentRuntimeID: sideChat.parentRuntimeID)
+      }
+    case .sessionIdle:
+      sideChat.busy = false
+      sealSideChatStreams(&sideChat)
+      settleSideChatTurnUsage(event, parentRuntimeID: sideChat.parentRuntimeID)
+    case .unknown:
+      // 侧聊 fork 会话的 message.updated 用量帧:攒最新一份,等轮次结束的
+      // idle 信号结算(与主通道 recordKimiRuntimeEvent 的 .unknown 分支同款)。
+      if let usage = Self.parseAssistantTurnUsage(payload: event.payload) {
+        turnUsageBySession[event.sessionID] = usage
+        if let messageID = event.messageID { turnMessageIDBySession[event.sessionID] = messageID }
+      }
+    case .error:
+      sideChat.error = event.text ?? "侧聊执行出错。"
+      sideChat.busy = false
+      sealSideChatStreams(&sideChat)
+    case .permissionAsked, .permissionReplied, .questionAsked, .questionReplied:
+      for mapped in KimiRuntimeEventBridge.map(event) {
+        apply(mapped)
+      }
+    default:
+      break
+    }
+    state.sideChat = sideChat
+    publish(.sideChatUpdated)
+  }
+
+  private func sealSideChatStreams(_ sideChat: inout KimiSideChatState) {
+    for index in sideChat.messages.indices where sideChat.messages[index].isStreaming {
+      sideChat.messages[index].isStreaming = false
+    }
   }
 
   private func ingest(_ event: EngineRuntimeEvent) async {
+    if event.sessionID == state.sideChat?.sessionRuntimeID {
+      await ingestSideChat(event)
+      return
+    }
     if event.kind == .error, recentlyAbortedSessions.remove(event.sessionID) != nil {
       return
     }
@@ -810,8 +1313,21 @@ public actor KimiAppKernel {
       state.lastUserMessageIDBySession[event.sessionID] = messageID
     }
     await recordKimiRuntimeEvent(event)
+    // 主时间线(state.messages/activities/todos)只承载活跃会话。其余会话的
+    // 文本/活动事件若照样 append,会在双会话分屏或后台任务运行时污染当前
+    // 时间线;它们改走 .sessionEvent 直通,由 ViewModel 的次会话列消费。
+    // 按会话键控的全局投影(busySessionIDs/pendingPermissions/pendingQuestions)
+    // 不受此过滤影响。
+    let activeRuntimeID = state.sessions
+      .first(where: { $0.id == state.activeSessionID })
+      .map { $0.runtimeID ?? $0.id.uuidString }
+    let isActiveSession = event.sessionID == activeRuntimeID
+    if !isActiveSession {
+      publish(.sessionEvent(event))
+    }
     var persistImmediately = true
     for mapped in KimiRuntimeEventBridge.map(event) {
+      if !isActiveSession, mapped.targetsActiveTimeline { continue }
       apply(mapped)
       publish(mapped)
       if case .assistantText = mapped { persistImmediately = false }
@@ -891,7 +1407,11 @@ public actor KimiAppKernel {
       state.pendingQuestions.removeAll { $0.runtimeID == requestID }
     case let .activity(activity):
       if let index = state.activities.firstIndex(where: { $0.toolCallID == activity.toolCallID && activity.toolCallID != nil }) {
-        state.activities[index] = activity
+        // 工具结果帧整卡替换时保留首帧的创建时间,后台任务面板的耗时
+        // (updatedAt - createdAt)才是真实执行时长而非刷新间隔。
+        var merged = activity
+        merged.createdAt = state.activities[index].createdAt
+        state.activities[index] = merged
       } else { state.activities.append(activity) }
     case let .permission(permission):
       // The engine re-emits permission.asked after a reply; without dedupe by
@@ -902,6 +1422,12 @@ public actor KimiAppKernel {
       if !state.pendingPermissions.contains(where: { $0.id == permission.id }) { state.pendingPermissions.append(permission) }
     case let .error(message):
       state.lastError = message
+    case .sideChatUpdated:
+      // 纯刷新信号:侧聊状态由 ingestSideChat 直接维护。
+      break
+    case .sessionEvent:
+      // 非活跃会话的原始事件直通,不投影进主时间线;ingest 也不会把它送进 apply。
+      break
     }
   }
 
@@ -942,6 +1468,30 @@ public actor KimiAppKernel {
   private func respondToPermission(_ id: UUID, reply: String) async {
     guard let permission = state.pendingPermissions.first(where: { $0.id == id }) else { return }
     guard let operationID = permissionOperations[id], let sessionID = operationSessions[operationID] else {
+      // 侧聊/分屏次会话的 prompt 不经 Harness,没有 operation 映射;但权限
+      // 回复端点(/permission/:id/reply)本身不需要 operation 上下文,按请求
+      // 自带的会话 ID 直接回复即可。
+      if let sessionRuntimeID = permission.sessionRuntimeID,
+         state.sideChat?.sessionRuntimeID == sessionRuntimeID
+           || state.sessions.contains(where: { ($0.runtimeID ?? $0.id.uuidString) == sessionRuntimeID }) {
+        let directory = state.sideChat?.sessionRuntimeID == sessionRuntimeID
+          ? state.sideChat?.directory
+          : directoryForSession(sessionRuntimeID)
+        do {
+          try await sessionClient.respondPermission(PermissionResponse(
+            sessionID: sessionRuntimeID,
+            requestID: permission.runtimeID ?? permission.id.uuidString,
+            reply: reply,
+            directory: directory
+          ))
+        } catch {
+          state.lastError = "审批回复失败（请求可能已过期）：\(error.localizedDescription)"
+          publish(.error(state.lastError ?? "审批回复失败。"))
+        }
+        state.pendingPermissions.removeAll { $0.id == id }
+        persistState()
+        return
+      }
       state.pendingPermissions.removeAll { $0.id == id }
       state.lastError = "该审批请求已过期，请重新发起操作。"
       publish(.error(state.lastError ?? "该审批请求已过期。"))
@@ -1004,6 +1554,26 @@ public actor KimiAppKernel {
         )),
         operationID: operationID
       )
+      // Settle the turn's token usage into the ledger at the same dedupe
+      // point: the entry id derives from the turn id, so a replayed or
+      // double-settled turn can never be billed twice.
+      if let usage = turnUsageBySession.removeValue(forKey: event.sessionID) {
+        let latencyMS = turnStartedAtBySession.removeValue(forKey: event.sessionID)
+          .map { max(0, Int(Date().timeIntervalSince($0) * 1_000)) } ?? 0
+        settleTurnUsage(
+          usage,
+          entryID: Self.usageLedgerEntryID(turnID: turnID),
+          operationID: operationID,
+          sessionID: event.sessionID,
+          latencyMS: latencyMS
+        )
+      }
+    case .unknown:
+      // Assistant message.updated frames stream cumulative usage; keep the
+      // latest one so turn settlement reads the final counts.
+      if let usage = Self.parseAssistantTurnUsage(payload: event.payload) {
+        turnUsageBySession[event.sessionID] = usage
+      }
     case .permissionAsked:
       permissionOperations[event.id] = operationID
     case .toolCall:
@@ -1059,17 +1629,152 @@ public actor KimiAppKernel {
     ToolCatalog.defaultDefinitions.first(where: { $0.id == toolID })?.risk ?? .medium
   }
 
+  /// 把一轮的 token 用量结算进 UsageLedger:计价优先本地价目表,引擎上报
+  /// 成本仅作显式标记的兜底(unknown price 不伪装成 0)。entryID 由调用方
+  /// 按轮次确定性生成,重复结算/重放命中账本的 id 去重,不会重复计费。
+  private func settleTurnUsage(_ usage: AssistantTurnUsage, entryID: UUID, operationID: UUID, sessionID: String, latencyMS: Int) {
+    guard let usageLedger else { return }
+    let model = state.selectedModel
+    let provider = KimiRuntimeIdentityStore.providerID
+    let pricing = ModelPriceCatalog.cost(
+      provider: provider,
+      model: model,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.billedOutputTokens,
+      cachedTokens: usage.cachedTokens
+    )
+    let estimatedCost: Decimal
+    let pricingStatus: UsageCostStatus
+    if pricing.status == .calculated {
+      estimatedCost = pricing.value
+      pricingStatus = .calculated
+    } else if let engineCost = usage.engineCost {
+      estimatedCost = engineCost
+      pricingStatus = .estimated
+    } else {
+      estimatedCost = 0
+      pricingStatus = .unconfigured
+    }
+    try? usageLedger.append(UsageLedgerEntry(
+      id: entryID,
+      operationID: operationID,
+      stage: .implement,
+      provider: provider,
+      model: model,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.billedOutputTokens,
+      cachedTokens: usage.cachedTokens,
+      latencyMS: latencyMS,
+      estimatedCost: estimatedCost,
+      qualityScore: nil,
+      pricingStatus: pricingStatus,
+      sessionID: sessionID
+    ))
+  }
+
+  /// 侧聊轮次的用量结算:prompt 直连引擎、不经 Harness,没有 operation
+  /// 映射,但 fork 会话的 watch 流同样下发 message.updated 用量帧与 idle
+  /// 完成信号。sessionID 记主会话 runtimeID,会话头部的按会话用量聚合
+  /// (sessionUsage)因此自动包含侧聊消耗。operationID 无对应 Harness 操作,
+  /// 用轮次键派生的确定性 UUID 占位。
+  private func settleSideChatTurnUsage(_ event: EngineRuntimeEvent, parentRuntimeID: String) {
+    guard event.turnOutcome == .completed,
+          let usage = turnUsageBySession.removeValue(forKey: event.sessionID) else { return }
+    let messageKey = turnMessageIDBySession.removeValue(forKey: event.sessionID) ?? UUID().uuidString
+    let turnKey = "sidechat|\(event.sessionID)|\(messageKey)"
+    let latencyMS = turnStartedAtBySession.removeValue(forKey: event.sessionID)
+      .map { max(0, Int(Date().timeIntervalSince($0) * 1_000)) } ?? 0
+    settleTurnUsage(
+      usage,
+      entryID: Self.usageLedgerEntryID(key: turnKey),
+      operationID: Self.usageLedgerEntryID(key: "\(turnKey)|operation"),
+      sessionID: parentRuntimeID,
+      latencyMS: latencyMS
+    )
+  }
+
+  /// One assistant turn's usage as reported by the engine's
+  /// `message.updated` frame. Reasoning tokens are billed as output; cache
+  /// read/write fold into the ledger's single cachedTokens field.
+  private struct AssistantTurnUsage: Sendable {
+    var inputTokens: Int
+    var outputTokens: Int
+    var reasoningTokens: Int
+    var cacheReadTokens: Int
+    var cacheWriteTokens: Int
+    var engineCost: Decimal?
+
+    var billedOutputTokens: Int { outputTokens + reasoningTokens }
+    var cachedTokens: Int { cacheReadTokens + cacheWriteTokens }
+  }
+
+  /// Parses the decoder-forwarded usage payload. JSON numbers arrive as
+  /// NSNumber regardless of whether the engine sent Int or Double.
+  private static func parseAssistantTurnUsage(payload: [String: String]) -> AssistantTurnUsage? {
+    guard let raw = payload["usageTokens"],
+          let data = raw.data(using: .utf8),
+          let tokens = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    func intField(_ container: [String: Any]?, _ key: String) -> Int {
+      guard let container else { return 0 }
+      if let number = container[key] as? NSNumber { return max(0, number.intValue) }
+      if let string = container[key] as? String, let value = Int(string) { return max(0, value) }
+      return 0
+    }
+    let cache = tokens["cache"] as? [String: Any]
+    var engineCost: Decimal? = nil
+    if let rawCost = payload["usageCost"], let cost = Decimal(string: rawCost), cost >= 0 {
+      engineCost = cost
+    }
+    return AssistantTurnUsage(
+      inputTokens: intField(tokens, "input"),
+      outputTokens: intField(tokens, "output"),
+      reasoningTokens: intField(tokens, "reasoning"),
+      cacheReadTokens: intField(cache, "read"),
+      cacheWriteTokens: intField(cache, "write"),
+      engineCost: engineCost
+    )
+  }
+
+  /// Deterministic per-turn entry id: settling the same turn twice (replayed
+  /// SSE frames, ledger restored from disk while the in-memory dedupe set was
+  /// reset) hits UsageLedger's id dedupe instead of double-billing.
+  private static func usageLedgerEntryID(turnID: UUID) -> UUID {
+    usageLedgerEntryID(key: turnID.uuidString)
+  }
+
+  /// 侧聊等不经 Harness 的轮次没有 checkpoint turnID,按自定义键派生。
+  private static func usageLedgerEntryID(key: String) -> UUID {
+    let hex = HarnessDigest.sha256("kimi-usage-ledger|\(key)")
+    let formatted = "\(hex.prefix(8))-\(hex.dropFirst(8).prefix(4))-\(hex.dropFirst(12).prefix(4))-\(hex.dropFirst(16).prefix(4))-\(hex.dropFirst(20).prefix(12))"
+    return UUID(uuidString: formatted) ?? UUID()
+  }
+
   /// Computes the working-tree diff of the active session's project against
   /// the local git checkout. Spawns git off the actor so big diffs never
   /// stall event ingestion.
   public func loadDiffSnapshot() async -> DiffSnapshot? {
+    switch await loadDiffOutcome() {
+    case .snapshot(let snapshot): return snapshot
+    case .noActiveProject, .failed: return nil
+    }
+  }
+
+  /// Like loadDiffSnapshot() but keeps the failure reason instead of folding
+  /// every error into nil — the diff panel must not render a failed git
+  /// invocation as "no changes".
+  public func loadDiffOutcome() async -> KimiDiffLoadOutcome {
     guard let activeID = state.activeSessionID,
-          let projectPath = state.sessions.first(where: { $0.id == activeID })?.projectPath,
-          !projectPath.isEmpty else { return nil }
+          let projectPath = state.sessions.first(where: { $0.id == activeID })?.workingPath,
+          !projectPath.isEmpty else { return .noActiveProject }
     let directory = URL(fileURLWithPath: projectPath, isDirectory: true)
-    return try? await Task.detached(priority: .userInitiated) {
-      try DiffEngine.snapshot(baseDirectory: directory)
-    }.value
+    do {
+      let snapshot = try await Task.detached(priority: .userInitiated) {
+        try DiffEngine.snapshot(baseDirectory: directory)
+      }.value
+      return .snapshot(snapshot)
+    } catch {
+      return .failed(error.localizedDescription)
+    }
   }
 
   /// Live MCP server health and discovered skills for the integrations panel.
@@ -1129,6 +1834,12 @@ public actor KimiAppKernel {
   private func removeContinuation(_ token: UUID) {
     continuations.removeValue(forKey: token)
   }
+}
+
+public enum KimiDiffLoadOutcome: Sendable {
+  case noActiveProject
+  case snapshot(DiffSnapshot)
+  case failed(String)
 }
 
 public final class UnavailableKimiRuntimeSessionClient: EngineProvider, @unchecked Sendable {

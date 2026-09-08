@@ -1,15 +1,35 @@
 import SwiftUI
+import AppKit
 import KimiAgentCore
 
 struct KimiSidebarView: View {
   @ObservedObject var model: KimiAppViewModel
   var onOpenSettings: (() -> Void)? = nil
+  @State private var searchText = ""
+  @State private var statusFilter: SidebarStatusFilter = .all
+
+  /// 会话摘要的 status 字段目前恒为 idle，真实运行态取自
+  /// busySessionIDs 与 pendingPermissions（与头部停止按钮同源）。
+  private enum SidebarStatusFilter: String, CaseIterable {
+    case all = "全部"
+    case running = "运行中"
+    case awaitingApproval = "待审批"
+    case finished = "已完成"
+  }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 14) {
       header
       newSessionButton
       homeButton
+      searchField
+      Picker("", selection: $statusFilter) {
+        ForEach(SidebarStatusFilter.allCases, id: \.self) { filter in
+          Text(filter.rawValue).tag(filter)
+        }
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
       Text("项目")
         .font(.caption.weight(.semibold))
         .foregroundStyle(KimiDesign.muted)
@@ -20,6 +40,30 @@ struct KimiSidebarView: View {
     }
     .padding(16)
     .background(KimiDesign.surface)
+    .background(deleteConfirmationDialog)
+  }
+
+  private var searchField: some View {
+    HStack(spacing: 6) {
+      Image(systemName: "magnifyingglass")
+        .font(.caption)
+        .foregroundStyle(KimiDesign.muted)
+      TextField("搜索会话或项目", text: $searchText)
+        .textFieldStyle(.plain)
+        .font(.subheadline)
+      if !searchText.isEmpty {
+        Button { searchText = "" } label: {
+          Image(systemName: "xmark.circle.fill")
+            .font(.caption)
+            .foregroundStyle(KimiDesign.muted)
+        }
+        .buttonStyle(.plain)
+      }
+    }
+    .padding(.horizontal, 10)
+    .padding(.vertical, 7)
+    .background(KimiDesign.surfaceSecondary)
+    .clipShape(RoundedRectangle(cornerRadius: 8))
   }
 
   private var header: some View {
@@ -98,13 +142,22 @@ struct KimiSidebarView: View {
             .foregroundStyle(KimiDesign.muted)
             .frame(maxWidth: .infinity, alignment: .center)
             .padding(.top, 24)
+        } else if groupedSessions.isEmpty {
+          Text("没有匹配的会话")
+            .font(.caption)
+            .foregroundStyle(KimiDesign.muted)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.top, 24)
         }
       }
     }
   }
 
   private func sessionRow(_ session: KimiSessionSummary) -> some View {
-    Button { model.select(session.id) } label: {
+    Button {
+      // ⌘点击 = 开/关双会话分屏;普通点击在分屏中替换焦点侧。
+      model.handleSidebarSelect(session.id, commandPressed: NSEvent.modifierFlags.contains(.command))
+    } label: {
       HStack(spacing: 8) {
         if session.parentRuntimeID != nil {
           Image(systemName: "arrow.triangle.branch")
@@ -119,23 +172,83 @@ struct KimiSidebarView: View {
             .font(.subheadline)
             .foregroundStyle(KimiDesign.text)
             .lineLimit(1)
-          Text(relativeTime(from: session.updatedAt))
-            .font(.caption2)
-            .foregroundStyle(KimiDesign.muted)
+          HStack(spacing: 4) {
+            Text(relativeTime(from: session.updatedAt))
+              .font(.caption2)
+              .foregroundStyle(KimiDesign.muted)
+            if let branch = session.worktreeBranch {
+              // worktree 徽标:分支名(去掉 kimi/ 前缀),表明会话在独立工作区运行。
+              Label(branch.replacingOccurrences(of: "kimi/", with: ""), systemImage: "arrow.triangle.branch")
+                .font(.caption2)
+                .foregroundStyle(KimiDesign.accent)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(KimiDesign.accent.opacity(0.12))
+                .clipShape(Capsule())
+                .help("独立工作区:\(session.worktreePath ?? "")")
+            }
+          }
         }
         Spacer(minLength: 0)
       }
       .padding(.horizontal, 10)
       .padding(.vertical, 7)
       .frame(maxWidth: .infinity, alignment: .leading)
-      .background(model.state.activeSessionID == session.id ? KimiDesign.surfaceSecondary : .clear)
+      .background(rowBackground(for: session))
       .clipShape(RoundedRectangle(cornerRadius: 8))
       .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
+    .help("⌘点击在分屏中并排打开")
     .contextMenu {
       Button("从此会话分支") { model.forkSession(session.id, messageID: nil) }
+      Button(model.secondarySessionID == session.id ? "关闭分屏" : "在分屏中并排打开") {
+        model.toggleSplitSession(session.id)
+      }
+      .disabled(session.id == model.state.activeSessionID && model.secondarySessionID == nil)
+      Divider()
+      Button("删除会话…", role: .destructive) { model.requestDeleteSession(session) }
     }
+  }
+
+  /// 选中态:活跃会话与分屏次列会话都高亮,次列用 accent 区分。
+  private func rowBackground(for session: KimiSessionSummary) -> Color {
+    if model.state.activeSessionID == session.id { return KimiDesign.surfaceSecondary }
+    if model.secondarySessionID == session.id { return KimiDesign.accent.opacity(0.12) }
+    return .clear
+  }
+
+  /// 删除会话确认:worktree 会话询问是否一并清理工作区,有未提交改动时警告。
+  private var deleteConfirmationDialog: some View {
+    Color.clear.frame(width: 0, height: 0)
+      .confirmationDialog(
+        "删除会话",
+        isPresented: Binding(
+          get: { model.sessionPendingDeletion != nil },
+          set: { if !$0 { model.cancelDeleteSession() } }
+        ),
+        titleVisibility: .visible
+      ) {
+        if let session = model.sessionPendingDeletion {
+          if session.worktreePath != nil {
+            Button("删除会话并清理工作区", role: .destructive) { model.confirmDeleteSession(removeWorktree: true) }
+            Button("仅删除会话（保留工作区）") { model.confirmDeleteSession(removeWorktree: false) }
+          } else {
+            Button("删除会话", role: .destructive) { model.confirmDeleteSession(removeWorktree: false) }
+          }
+          Button("取消", role: .cancel) { model.cancelDeleteSession() }
+        }
+      } message: {
+        if let session = model.sessionPendingDeletion {
+          if session.worktreePath != nil {
+            Text(model.pendingDeletionWorktreeDirty
+              ? "「\(session.title)」的独立工作区有未提交的改动，清理工作区将永久丢弃它们。"
+              : "「\(session.title)」在独立工作区运行，可选择一并清理该工作区（git worktree remove）。")
+          } else {
+            Text("将删除「\(session.title)」及其全部历史，不可恢复。")
+          }
+        }
+      }
   }
 
   private var footer: some View {
@@ -146,9 +259,9 @@ struct KimiSidebarView: View {
         Text(userName).font(.caption.weight(.medium)).lineLimit(1)
         HStack(spacing: 4) {
           Circle()
-            .fill(model.state.runtimeState == .ready ? .green : .orange)
+            .fill(runtimeStatusColor)
             .frame(width: 6, height: 6)
-          Text(model.state.runtimeState == .ready ? "运行时已连接" : "正在连接")
+          Text(runtimeStatusText)
             .font(.caption2)
             .foregroundStyle(KimiDesign.muted)
         }
@@ -166,6 +279,26 @@ struct KimiSidebarView: View {
       }
       .menuStyle(.borderlessButton)
       .menuIndicator(.hidden)
+    }
+  }
+
+  /// Honest three-state runtime status: a failed engine must never read as
+  /// "正在连接".
+  private var runtimeStatusColor: Color {
+    switch model.state.runtimeState {
+    case .ready: return .green
+    case .failed: return .red
+    case .starting, .stopping, .stopped, .degraded: return .orange
+    }
+  }
+
+  private var runtimeStatusText: String {
+    switch model.state.runtimeState {
+    case .ready: return "运行时已连接"
+    case .failed: return "引擎故障，点齿轮菜单重启"
+    case .degraded: return "引擎未就绪"
+    case .starting: return "正在连接"
+    case .stopping, .stopped: return "运行时已停止"
     }
   }
 
@@ -200,7 +333,7 @@ struct KimiSidebarView: View {
   private static let scratchGroupKey = "kimi-scratch"
 
   private var groupedSessions: [SessionGroup] {
-    let grouped = Dictionary(grouping: model.state.sessions) { session in
+    let grouped = Dictionary(grouping: filteredSessions) { session in
       session.isScratch ? Self.scratchGroupKey : (session.projectPath ?? "")
     }
     let groups = grouped.map { key, sessions -> SessionGroup in
@@ -265,6 +398,33 @@ struct KimiSidebarView: View {
       let childMax = node.children.flatMap(mostRecentUpdate) ?? .distantPast
       return max(node.session.updatedAt, childMax)
     }.max()
+  }
+
+  private func isAwaitingApproval(_ runtimeID: String) -> Bool {
+    model.state.pendingPermissions.contains { $0.runtimeID == runtimeID }
+  }
+
+  private var filteredSessions: [KimiSessionSummary] {
+    let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return model.state.sessions.filter { session in
+      let runtimeID = session.runtimeID ?? session.id.uuidString
+      let running = model.state.busySessionIDs.contains(runtimeID)
+      switch statusFilter {
+      case .all:
+        break
+      case .running:
+        guard running else { return false }
+      case .awaitingApproval:
+        guard isAwaitingApproval(runtimeID) else { return false }
+      case .finished:
+        guard !running, !isAwaitingApproval(runtimeID) else { return false }
+      }
+      guard !query.isEmpty else { return true }
+      let projectName = session.isScratch
+        ? "临时对话"
+        : session.projectPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? ""
+      return session.title.lowercased().contains(query) || projectName.lowercased().contains(query)
+    }
   }
 
   private var userName: String {

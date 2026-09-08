@@ -253,6 +253,93 @@ final class StreamingScriptKimiRuntimeClient: EngineProvider, @unchecked Sendabl
   }
 }
 
+/// Streams one scripted assistant turn whose message.updated frame carries
+/// token usage and cost, gated on the first prompt so the kernel has already
+/// bound the operation before the settlement frames arrive. The trailing
+/// duplicate idle frame exercises the no-double-billing dedupe.
+final class UsageScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
+  let promptGate = OneShotAsyncGate()
+
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "usage-session", title: "用量", directory: "/tmp/usage")
+  }
+
+  func prompt(_ input: KimiRuntimePromptInput) async throws { await promptGate.open() }
+  func steer(_ input: KimiRuntimeSteerInput) async throws {}
+  func abort(sessionID: String, directory: String?) async throws {}
+  func respondPermission(_ input: PermissionResponse) async throws {}
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
+    AsyncThrowingStream { continuation in
+      Task {
+        await self.promptGate.wait()
+        try? await Task.sleep(for: .milliseconds(120))
+        let decoder = KimiRuntimeEventDecoder()
+        let frames = [
+          #"{"type":"message.updated","properties":{"sessionID":"\#(sessionID)","info":{"id":"m-usage-1","role":"assistant","tokens":{"input":1200,"output":300,"reasoning":50,"cache":{"read":400,"write":100}},"cost":0.0025}}}"#,
+          #"{"type":"session.idle","properties":{"sessionID":"\#(sessionID)"}}"#,
+          #"{"type":"session.idle","properties":{"sessionID":"\#(sessionID)"}}"#
+        ]
+        for frame in frames {
+          if let event = decoder.decode(Data(frame.utf8), sessionID: sessionID) {
+            continuation.yield(event)
+          }
+        }
+        continuation.finish()
+      }
+    }
+  }
+}
+
+/// 侧聊用量脚本:openSideChat fork 出的临时会话,其 watch 流在侧聊 prompt
+/// 送达后用生产 decoder 重放 message.updated(带 tokens/cost)+ 两个
+/// session.idle(验证重放不重复计费),驱动 kernel 的侧聊计账路径。
+final class SideChatUsageScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
+  let sideChatPromptGate = OneShotAsyncGate()
+
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "sidechat-parent", title: "主会话", directory: input.directory)
+  }
+
+  func forkSession(sessionID: String, messageID: String?, directory: String?) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "sidechat-fork", title: "侧聊", directory: directory, parentID: sessionID)
+  }
+
+  func prompt(_ input: KimiRuntimePromptInput) async throws {
+    if input.sessionID == "sidechat-fork" { await sideChatPromptGate.open() }
+  }
+  func steer(_ input: KimiRuntimeSteerInput) async throws {}
+  func abort(sessionID: String, directory: String?) async throws {}
+  func respondPermission(_ input: PermissionResponse) async throws {}
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
+    AsyncThrowingStream { continuation in
+      guard sessionID == "sidechat-fork" else {
+        continuation.finish()
+        return
+      }
+      Task {
+        await self.sideChatPromptGate.wait()
+        try? await Task.sleep(for: .milliseconds(120))
+        let decoder = KimiRuntimeEventDecoder()
+        let frames = [
+          #"{"type":"message.updated","properties":{"sessionID":"\#(sessionID)","info":{"id":"m-side-1","role":"assistant","tokens":{"input":800,"output":120,"reasoning":30,"cache":{"read":60,"write":40}},"cost":0.0012}}}"#,
+          #"{"type":"session.idle","properties":{"sessionID":"\#(sessionID)"}}"#,
+          #"{"type":"session.idle","properties":{"sessionID":"\#(sessionID)"}}"#
+        ]
+        for frame in frames {
+          if let event = decoder.decode(Data(frame.utf8), sessionID: sessionID) {
+            continuation.yield(event)
+          }
+        }
+        continuation.finish()
+      }
+    }
+  }
+}
+
 /// Holds the turn open long enough for a steer message to be pumped in.
 final class SteerScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   let promptTrace = ThreadSafeStringTrace()
@@ -310,6 +397,33 @@ final class NeverIdleKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   }
 }
 
+/// Emits a busy status then closes the event stream without completing —
+/// the driver's waitForCompletion fails the turn, exercising the kernel's
+/// failure-surfacing and retry paths.
+final class DyingStreamKimiRuntimeClient: EngineProvider, @unchecked Sendable {
+  let promptTrace = ThreadSafeStringTrace()
+
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "dying-session", title: "断流", directory: input.directory)
+  }
+
+  func prompt(_ input: KimiRuntimePromptInput) async throws {
+    promptTrace.append(input.text)
+  }
+
+  func steer(_ input: KimiRuntimeSteerInput) async throws {}
+  func abort(sessionID: String, directory: String?) async throws {}
+  func respondPermission(_ input: PermissionResponse) async throws {}
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<EngineRuntimeEvent, Error> {
+    AsyncThrowingStream { continuation in
+      continuation.yield(EngineRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
+      continuation.finish()
+    }
+  }
+}
+
 /// Serves a canned two-message conversation for history-restore checks.
 final class HistoryScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
@@ -353,6 +467,7 @@ final class VerifyScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   private let lock = NSLock()
   private var _addedMCPServers: [KimiMCPServerEntry] = []
   private var _removedMCPServerNames: [String] = []
+  private var _deletedSessionIDs: [String] = []
 
   var addedMCPServers: [KimiMCPServerEntry] {
     lock.lock(); defer { lock.unlock() }
@@ -362,6 +477,11 @@ final class VerifyScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   var removedMCPServerNames: [String] {
     lock.lock(); defer { lock.unlock() }
     return _removedMCPServerNames
+  }
+
+  var deletedSessionIDs: [String] {
+    lock.lock(); defer { lock.unlock() }
+    return _deletedSessionIDs
   }
 
   private var _forkCounter = 0
@@ -383,6 +503,10 @@ final class VerifyScriptKimiRuntimeClient: EngineProvider, @unchecked Sendable {
   func abort(sessionID: String, directory: String?) async throws {}
   func respondPermission(_ input: PermissionResponse) async throws {}
   func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func deleteSession(sessionID: String, directory: String?) async throws {
+    lock.withLock { _deletedSessionIDs.append(sessionID) }
+  }
 
   func addMCPServer(_ entry: KimiMCPServerEntry, directory: String?) async throws {
     lock.withLock { _addedMCPServers.append(entry) }
@@ -740,6 +864,23 @@ let unpricedEntry = UsageLedgerEntry(operationID: UUID(), stage: .explore, provi
 expect(unpricedEntry.pricingStatus == .unconfigured, "未知模型价格必须标记为未配置，不能把 0 当成真实成本")
 expect(CostBudgetGate.decision(spent: 0.81, budget: 1) == .warning, "成本达到 80% 时必须进入预警")
 expect(CostBudgetGate.decision(spent: 1.01, budget: 1) == .exceeded, "超过任务预算必须阻止继续调用")
+
+// 任务 A:decoder 必须从 assistant message.updated 提取 tokens/cost 进入 payload
+let usageDecoder = KimiRuntimeEventDecoder()
+let usageUpdatedEvent = usageDecoder.decode(Data(#"{"type":"message.updated","properties":{"sessionID":"s-usage","info":{"id":"m-a1","role":"assistant","tokens":{"input":1200,"output":300.0,"reasoning":50,"cache":{"read":400,"write":100}},"cost":0.0025}}}"#.utf8), sessionID: "s-usage")
+expect(usageUpdatedEvent?.payload["usageTokens"] != nil && usageUpdatedEvent?.payload["usageCost"] == "0.0025", "decoder 必须从 assistant message.updated 提取 tokens 与 cost 进入 payload")
+expect(usageUpdatedEvent?.messageID == "m-a1", "assistant message.updated 必须携带消息 ID 供按 turn 归集")
+let usageUserUpdatedEvent = usageDecoder.decode(Data(#"{"type":"message.updated","properties":{"sessionID":"s-usage","info":{"id":"m-u1","role":"user"}}}"#.utf8), sessionID: "s-usage")
+expect(usageUserUpdatedEvent?.kind == .userText && usageUserUpdatedEvent?.payload["usageTokens"] == nil, "user message.updated 过滤逻辑不得被 usage 提取破坏")
+
+// 任务 A:UsageLedger(fileURL:) 持久化往返（此前未测）
+let ledgerRoundTripFile = temporaryDirectory.appendingPathComponent("usage-ledger-roundtrip/usage-ledger.json")
+let ledgerRoundTrip = UsageLedger(fileURL: ledgerRoundTripFile)
+try ledgerRoundTrip.append(usageEntry)
+let ledgerRestored = UsageLedger(fileURL: ledgerRoundTripFile)
+expect(ledgerRestored.snapshot() == [usageEntry] && ledgerRestored.totalCost() == 0.1, "UsageLedger(fileURL:) 必须从磁盘恢复既有账目")
+try ledgerRestored.append(usageEntry)
+expect(UsageLedger(fileURL: ledgerRoundTripFile).snapshot().count == 1, "磁盘恢复的账本对同一 Entry 重放仍不得重复计费")
 let memoryURL = temporaryDirectory.appendingPathComponent("memory.json")
 let memoryStore = MemoryStore(fileURL: memoryURL)
 try memoryStore.upsert(MemoryRecord(scope: .project, kind: .fact, content: "测试命令是 swift test", provenance: .userConfirmed))
@@ -3497,6 +3638,53 @@ let pluginTupleOptions = pluginTuple?.count == 2 ? pluginTuple?[1] as? [String: 
 expect(pluginTupleOptions?["systemPromptRules"] as? [String] == ["总是用简体中文回复"], "配置了 Hook 规则时，plugin 字段第二个元素必须携带 systemPromptRules")
 expect(pluginTupleOptions?["permissionOverrides"] as? [String: String] == ["bash": "deny"], "配置了 Hook 规则时，plugin 字段第二个元素必须携带 permissionOverrides")
 
+// 任务 C:small_model 低成本路由可配置（KIMI_SMALL_MODEL opt-in，未设置时行为不变）
+let smallModelSupport = temporaryDirectory.appendingPathComponent("small-model-support", isDirectory: true)
+let smallModelConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: smallModelSupport,
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs",
+    "KIMI_SMALL_MODEL": "kimi-k2-lite"
+  ],
+  modelID: "kimi-k2.7-code"
+)
+let smallModelConfigJSON = smallModelConfig?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
+let smallModelConfigObj = (try? JSONSerialization.jsonObject(with: Data(smallModelConfigJSON.utf8)) as? [String: Any]) ?? [:]
+expect(smallModelConfigObj["small_model"] as? String == "moonshotai-cn/kimi-k2-lite", "设置 KIMI_SMALL_MODEL 后 small_model 必须路由到低成本模型")
+expect(smallModelConfigObj["model"] as? String == "moonshotai-cn/kimi-k2.7-code", "KIMI_SMALL_MODEL 不得改变主模型")
+let smallModelProviderModels = ((smallModelConfigObj["provider"] as? [String: Any])?["moonshotai-cn"] as? [String: Any])?["models"] as? [String: Any]
+expect(smallModelProviderModels?["kimi-k2-lite"] != nil, "KIMI_SMALL_MODEL 指定的模型必须登记进 provider models 表，否则引擎校验失败")
+let defaultSmallModelConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: smallModelSupport,
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+  ],
+  modelID: "kimi-k2.7-code"
+)
+let defaultSmallModelJSON = defaultSmallModelConfig?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
+let defaultSmallModelObj = (try? JSONSerialization.jsonObject(with: Data(defaultSmallModelJSON.utf8)) as? [String: Any]) ?? [:]
+expect(defaultSmallModelObj["small_model"] as? String == defaultSmallModelObj["model"] as? String, "未设置 KIMI_SMALL_MODEL 时 small_model 必须保持与主模型一致")
+let sameAsMainConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: smallModelSupport,
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs",
+    "KIMI_SMALL_MODEL": " kimi-k2.7-code "
+  ],
+  modelID: "kimi-k2.7-code"
+)
+let sameAsMainJSON = sameAsMainConfig?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
+let sameAsMainObj = (try? JSONSerialization.jsonObject(with: Data(sameAsMainJSON.utf8)) as? [String: Any]) ?? [:]
+expect(sameAsMainObj["small_model"] as? String == "moonshotai-cn/kimi-k2.7-code", "KIMI_SMALL_MODEL 与主模型相同或仅含空白时必须按未设置处理")
+
 // EngineProvider abstraction: AnthropicDirectEngineProvider is a second real
 // backend behind the exact same protocol opencode's URLSessionRuntimeClient
 // implements. These checks drive it through a mocked Anthropic Messages API
@@ -3598,6 +3786,78 @@ try! awaitValue {
 }
 MockURLProtocol.requestHandler = nil
 expect(anthropicDriverTrace.snapshot.contains("turn-ended"), "KimiRuntimeOperationDriver 必须能在完全不知道后端是 opencode 还是 Anthropic 直连的情况下，正常驱动 Anthropic 后端的一轮对话到 turn-ended")
+
+// 任务 D:AnthropicDirectEngineProvider 工具执行必须过 PermissionPolicy 且
+// fail-closed —— 该后端没有审批应答能力，凡需确认的操作一律拒绝。
+func anthropicToolScenario(directory: String, toolName: String, toolInputJSON: String) async throws -> [EngineRuntimeEvent] {
+  let escapedInput = toolInputJSON
+    .replacingOccurrences(of: "\\", with: "\\\\")
+    .replacingOccurrences(of: "\"", with: "\\\"")
+  MockURLProtocol.requestHandler = { request in
+    let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "text/event-stream"])!
+    let bodyData = request.httpBody ?? Data()
+    let body = (try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]) ?? [:]
+    let messages = body["messages"] as? [[String: Any]] ?? []
+    let hasToolResult = messages.contains { message in
+      ((message["content"] as? [[String: Any]]) ?? []).contains { ($0["type"] as? String) == "tool_result" }
+    }
+    if hasToolResult {
+      let stream = "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"完成\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+      return (response, Data(stream.utf8))
+    }
+    let stream = """
+    data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"tool-gate","name":"\(toolName)"}}
+
+    data: {"type":"content_block_delta","delta":{"partial_json":"\(escapedInput)"}}
+
+    data: {"type":"content_block_stop"}
+
+    data: {"type":"message_stop"}
+
+    """
+    return (response, Data(stream.utf8))
+  }
+  let provider = AnthropicDirectEngineProvider(apiKey: "test-key", model: "claude-sonnet-4-6", session: anthropicMockSession)
+  let session = try await provider.createSession(CreateSessionInput(directory: directory, title: "gate-test"))
+  let stream = try await provider.subscribeEvents(sessionID: session.id, directory: directory)
+  try await provider.prompt(KimiRuntimePromptInput(sessionID: session.id, text: "run tool", directory: directory))
+  var events: [EngineRuntimeEvent] = []
+  for try await event in stream {
+    events.append(event)
+    if event.turnOutcome != nil { break }
+  }
+  MockURLProtocol.requestHandler = nil
+  return events
+}
+
+let gateWorkspace = temporaryDirectory.appendingPathComponent("provider-gate-workspace", isDirectory: true)
+try! FileManager.default.createDirectory(at: gateWorkspace, withIntermediateDirectories: true)
+
+let gateOutsideFile = temporaryDirectory.appendingPathComponent("provider-gate-outside-\(UUID().uuidString).txt")
+let gateOutsideEvents = try! awaitValue {
+  try await anthropicToolScenario(directory: gateWorkspace.path, toolName: "write", toolInputJSON: "{\"path\":\"\(gateOutsideFile.path)\",\"content\":\"escape\"}")
+}
+let gateOutsideResult = gateOutsideEvents.first { $0.kind == .toolResult }
+expect(gateOutsideResult?.payload["status"] == "failed" && !FileManager.default.fileExists(atPath: gateOutsideFile.path), "工作区外 write 必须被拒绝且文件不得创建")
+
+let gateDangerEvents = try! awaitValue {
+  try await anthropicToolScenario(directory: gateWorkspace.path, toolName: "bash", toolInputJSON: "{\"command\":\"rm -rf /\"}")
+}
+let gateDangerResult = gateDangerEvents.first { $0.kind == .toolResult }
+expect(gateDangerResult?.payload["status"] == "failed" && (gateDangerResult?.text?.contains("拒绝") ?? false), "危险 bash 命令必须被直接拒绝")
+
+let gateAskEvents = try! awaitValue {
+  try await anthropicToolScenario(directory: gateWorkspace.path, toolName: "bash", toolInputJSON: "{\"command\":\"echo hi\"}")
+}
+let gateAskResult = gateAskEvents.first { $0.kind == .toolResult }
+expect(gateAskResult?.payload["status"] == "failed" && (gateAskResult?.text?.contains("fail-closed") ?? false), "需要审批的 bash 在无审批能力的后端必须 fail-closed 并说明原因")
+
+let gateInsideFile = gateWorkspace.appendingPathComponent("inside.txt")
+let gateInsideEvents = try! awaitValue {
+  try await anthropicToolScenario(directory: gateWorkspace.path, toolName: "write", toolInputJSON: "{\"path\":\"\(gateInsideFile.path)\",\"content\":\"ok\"}")
+}
+let gateInsideResult = gateInsideEvents.first { $0.kind == .toolResult }
+expect(gateInsideResult?.payload["status"] == "completed" && (try? String(contentsOf: gateInsideFile, encoding: .utf8)) == "ok", "工作区内合法 write 必须仍然成功")
 
 // Runtime data migration: legacy XDG locations must fold into the contained
 // runtime directory without overwriting anything.
@@ -3762,6 +4022,32 @@ _ = try! awaitValue { try await mockClient.prompt(KimiRuntimePromptInput(session
 expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/prompt_async?directory=") }), "Engine Prompt 必须按会话目录路由 query 参数")
 expect(bridgedPermission?.patterns == ["npm test"], "Permission Card 必须保留引擎下发的 patterns 列表")
 
+// 编辑预览:edit/write 权限请求 metadata 携带 {filepath, diff}，桥接必须透传给权限卡
+let editPermissionWireEvent = KimiRuntimeEventBridge.decodeSSEData(Data(#"{"type":"permission.asked","properties":{"id":"perm-edit-1","sessionID":"session-1","permission":"edit","patterns":["src/a.ts"],"metadata":{"filepath":"/tmp/proj/src/a.ts","diff":"Index: /tmp/proj/src/a.ts\n===================================================================\n--- /tmp/proj/src/a.ts\n+++ /tmp/proj/src/a.ts\n@@ -1,2 +1,2 @@\n const a = 1\n-const b = 2\n+const b = 3\n"}}}"#.utf8), sessionID: "session-1")
+let bridgedEditPermission = editPermissionWireEvent.flatMap { KimiRuntimeEventBridge.map($0).compactMap { event -> KimiPermissionRequest? in
+  if case let .permission(value) = event { return value }
+  return nil
+}.first }
+expect(bridgedEditPermission?.metadataFilePath == "/tmp/proj/src/a.ts", "edit 权限请求必须透传 metadata.filepath 供权限卡预览")
+expect(bridgedEditPermission?.metadataDiff?.contains("-const b = 2") == true, "edit 权限请求必须透传 metadata.diff 供权限卡预览")
+let previewFile = bridgedEditPermission.flatMap { DiffEngine.parseUnifiedDiff($0.metadataDiff ?? "", fallbackPath: $0.metadataFilePath ?? "file") }
+expect(previewFile?.additions == 1 && previewFile?.deletions == 1, "权限卡 diff 预览必须解析 metadata 里的 unified diff 增删统计")
+expect(previewFile?.path == "/tmp/proj/src/a.ts", "权限卡 diff 预览必须保留原始文件路径（含无 diff --git 头的补丁）")
+let newFilePreview = DiffEngine.parseUnifiedDiff("--- /tmp/proj/new.ts\n+++ /tmp/proj/new.ts\n@@ -0,0 +1,2 @@\n+line one\n+line two", fallbackPath: "/tmp/proj/new.ts")
+expect(newFilePreview?.status == .added && newFilePreview?.additions == 2, "新文件写入的 diff 预览必须识别为新增文件")
+
+// PR/CI 状态条:statusCheckRollup 汇总必须区分 CheckRun 与 StatusContext 两种形状
+let rollupSummary = KimiPRChecksSummary.summarize(rollup: [
+  ["__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"],
+  ["__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"],
+  ["__typename": "CheckRun", "status": "IN_PROGRESS"],
+  ["__typename": "StatusContext", "state": "SUCCESS"],
+  ["__typename": "StatusContext", "state": "PENDING"],
+  ["__typename": "StatusContext", "state": "ERROR"],
+])
+expect(rollupSummary.passed == 2 && rollupSummary.failed == 2 && rollupSummary.pending == 2, "PR 检查汇总必须正确区分通过/失败/进行中（含两种 rollup 形状）")
+expect(KimiPRChecksSummary.summarize(rollup: []) == KimiPRChecksSummary(), "空检查列表必须汇总为全零")
+
 // 会话分支：POST /session/{id}/fork，会话创建可携带 parentID
 let forkedSession = try! awaitValue { try await mockClient.forkSession(sessionID: "session-1", messageID: "msg-u1", directory: nil) }
 expect(forkedSession.id == "session-fork-1" && forkedSession.parentID == "session-1", "forkSession 必须解析新会话的 id 与 parentID")
@@ -3770,6 +4056,27 @@ _ = try! awaitValue { try await mockClient.forkSession(sessionID: "session-1", m
 expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/fork {}") }), "不指定 messageID 时分支必须携带空 body（分支全部历史）")
 _ = try! awaitValue { try await mockClient.createSession(CreateSessionInput(title: "子会话", parentID: "session-1")); return () }
 expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session") && $0.contains("\"parentID\":\"session-1\"") }), "创建会话时必须能携带 parentID 直接建立分支关系")
+try! awaitValue { try await mockClient.deleteSession(sessionID: "session-1", directory: "/tmp/kimi proj&x"); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("DELETE /session/session-1?directory=") }), "删除会话必须走 DELETE /session/{id} 并按目录路由 query 参数")
+
+// 侧聊(⌘;):fork 主会话为临时线程,事件不进主时间线,关闭即删除引擎会话
+let sideChatClient = VerifyScriptKimiRuntimeClient()
+let sideChatKernel = KimiAppKernel(sessionClient: sideChatClient)
+try! awaitValue { try await sideChatKernel.send(.createSession(directory: "/tmp/side-root")); return () }
+try! awaitValue { try await sideChatKernel.send(.openSideChat); return () }
+var sideChatSnapshot = await sideChatKernel.snapshot()
+let sideChatID = sideChatSnapshot.sideChat?.sessionRuntimeID
+expect(sideChatID != nil && sideChatID != "verify-session", "打开侧聊必须 fork 出独立的临时会话")
+expect(sideChatSnapshot.sideChat?.parentRuntimeID == "verify-session", "侧聊必须记录其 fork 来源的主会话 ID")
+expect(sideChatSnapshot.sessions.count == 1, "侧聊临时会话不得出现在侧栏会话列表")
+try! awaitValue { try await sideChatKernel.send(.sideChatPrompt("这个改动为什么这么做?")); return () }
+sideChatSnapshot = await sideChatKernel.snapshot()
+expect(sideChatSnapshot.sideChat?.messages.last?.text == "这个改动为什么这么做?", "侧聊消息必须进入侧聊线程")
+expect(sideChatSnapshot.messages.allSatisfy { $0.text != "这个改动为什么这么做?" }, "侧聊消息不得写入主会话时间线")
+try! awaitValue { try await sideChatKernel.send(.closeSideChat); return () }
+sideChatSnapshot = await sideChatKernel.snapshot()
+expect(sideChatSnapshot.sideChat == nil, "关闭侧聊后线程状态必须清空")
+expect(sideChatClient.deletedSessionIDs.contains(sideChatID ?? ""), "关闭侧聊必须删除引擎侧临时会话")
 
 // KimiAppKernel.forkSession 的端到端行为：分支后的新会话必须携带 parentRuntimeID 并成为激活会话
 let forkKernelClient = VerifyScriptKimiRuntimeClient()
@@ -3832,6 +4139,100 @@ expect(settledAssistant?.text == "你好，世界！", "同一 part 的 delta �
 let streamingSnapshot = try! awaitValue { await streamingKernel.snapshot() }
 expect(streamingSnapshot.messages.filter { $0.role == .assistant }.count == 1, "流式输出不得裂成多个气泡")
 expect(streamingSnapshot.busySessionIDs.isEmpty, "sessionIdle 后会话忙态必须清除")
+
+// 任务 A 端到端（脚本化客户端驱动真实 KimiAppKernel + 生产 decoder）：
+// 一个 turn 结算后恰好入账一次，重复 idle 重放不得重复计费。
+let kernelLedgerFile = temporaryDirectory.appendingPathComponent("kernel-usage-ledger/usage-ledger.json")
+let kernelLedger = UsageLedger(fileURL: kernelLedgerFile)
+let usageClient = UsageScriptKimiRuntimeClient()
+let usageKernel = KimiAppKernel(sessionClient: usageClient, usageLedger: kernelLedger)
+try! awaitValue { try await usageKernel.send(.createSession(directory: "/tmp/usage")); return () }
+try! awaitValue { try await usageKernel.send(.prompt(PromptInput(text: "记账"))); return () }
+let settledEntries = try! awaitValue { () async throws -> [UsageLedgerEntry] in
+  for _ in 0..<150 {
+    let entries = kernelLedger.snapshot()
+    if !entries.isEmpty { return entries }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return []
+}
+expect(settledEntries.count == 1, "一个 turn 结算后必须恰好入账一次（重复结算/重放不得重复计费）")
+expect(settledEntries.first?.inputTokens == 1_200 && settledEntries.first?.outputTokens == 350 && settledEntries.first?.cachedTokens == 500, "入账必须携带 message.updated 的 tokens（reasoning 计入 output，cache read/write 合并）")
+expect(settledEntries.first?.estimatedCost == Decimal(string: "0.0025")! && settledEntries.first?.pricingStatus == .estimated, "价格未配置时必须以引擎上报 cost 兜底并如实标记 estimated，不得伪装成 0")
+expect(settledEntries.first?.model.isEmpty == false && settledEntries.first?.provider == "moonshotai-cn", "入账必须记录所选模型与 provider")
+expect(UsageLedger(fileURL: kernelLedgerFile).snapshot().count == 1, "kernel 入账的 UsageLedger 必须持久化到磁盘并可恢复")
+
+// 侧聊计账:fork 会话(不经 Harness,prompt 直连)的 token/成本必须结算进
+// UsageLedger 并记到主会话 runtimeID 上——会话头部用量指示(sessionUsage 按
+// 会话聚合)因此自动包含侧聊消耗;重复的 idle 重放不得重复计费。
+let sideChatLedger = UsageLedger()
+let sideChatUsageClient = SideChatUsageScriptKimiRuntimeClient()
+let sideChatUsageKernel = KimiAppKernel(sessionClient: sideChatUsageClient, usageLedger: sideChatLedger)
+try! awaitValue { try await sideChatUsageKernel.send(.createSession(directory: "/tmp/sidechat")); return () }
+try! awaitValue { try await sideChatUsageKernel.send(.openSideChat); return () }
+let sideChatOpened = await sideChatUsageKernel.snapshot()
+expect(sideChatOpened.sideChat?.sessionRuntimeID == "sidechat-fork" && sideChatOpened.sideChat?.parentRuntimeID == "sidechat-parent", "打开侧聊必须 fork 出临时会话并记录主会话 runtimeID")
+try! awaitValue { try await sideChatUsageKernel.send(.sideChatPrompt("旁边问一句")); return () }
+let sideChatEntries = try! awaitValue { () async throws -> [UsageLedgerEntry] in
+  for _ in 0..<150 {
+    let entries = sideChatLedger.snapshot()
+    if !entries.isEmpty { return entries }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return []
+}
+expect(sideChatEntries.count == 1, "侧聊一个 turn 结算后必须恰好入账一次(重复 idle 重放不得重复计费)")
+expect(sideChatEntries.first?.sessionID == "sidechat-parent", "侧聊用量必须记到主会话 runtimeID 上,会话头部用量指示才能聚合侧聊消耗")
+expect(sideChatEntries.first?.inputTokens == 800 && sideChatEntries.first?.outputTokens == 150 && sideChatEntries.first?.cachedTokens == 100, "侧聊入账必须携带 message.updated 的 tokens(reasoning 计入 output,cache read/write 合并)")
+expect(sideChatEntries.first?.estimatedCost == Decimal(string: "0.0012")! && sideChatEntries.first?.pricingStatus == .estimated, "侧聊价格未配置时必须以引擎上报 cost 兜底并如实标记 estimated")
+let sideChatRollup = await sideChatUsageKernel.sessionUsage(sessionID: "sidechat-parent")
+expect(sideChatRollup?.tokens == 950 && sideChatRollup?.cost == Decimal(string: "0.0012")!, "sessionUsage 按主会话聚合必须包含侧聊消耗(800 input + 120 output + 30 reasoning)")
+try! awaitValue { try await sideChatUsageKernel.send(.closeSideChat); return () }
+let sideChatClosed = await sideChatUsageKernel.snapshot()
+expect(sideChatClosed.sideChat == nil, "关闭侧聊必须清除临时会话状态")
+
+// 任务 B:预算闸 opt-in（KIMI_AGENT_BUDGET_USD 正数才启用，超预算拒绝且错误上屏）
+let budgetLedger = UsageLedger()
+try budgetLedger.append(UsageLedgerEntry(operationID: UUID(), stage: .implement, provider: "moonshotai-cn", model: "kimi-k2.7-code", inputTokens: 1, outputTokens: 1, latencyMS: 1, estimatedCost: 5, qualityScore: nil))
+let budgetClient = IdleKimiRuntimeSessionClient()
+let budgetKernel = KimiAppKernel(sessionClient: budgetClient, usageLedger: budgetLedger)
+try! awaitValue { try await budgetKernel.send(.createSession(directory: "/tmp/budget")); return () }
+setenv("KIMI_AGENT_BUDGET_USD", "1", 1)
+let budgetFailure = try! awaitValue { () async throws -> String? in
+  do {
+    try await budgetKernel.send(.prompt(PromptInput(text: "超预算")))
+    return nil
+  } catch {
+    return error.localizedDescription
+  }
+}
+expect(budgetFailure?.contains("预算") == true, "超过 KIMI_AGENT_BUDGET_USD 预算时 prompt 必须被拒绝并给出中文说明")
+let budgetSnapshot = await budgetKernel.snapshot()
+expect(budgetSnapshot.messages.isEmpty && budgetSnapshot.lastError?.contains("预算") == true, "预算拦截后不得留下用户气泡，且错误必须上屏")
+expect(budgetClient.promptCount == 0, "超预算时 prompt 不得送达引擎")
+setenv("KIMI_AGENT_BUDGET_USD", "100", 1)
+try! awaitValue { try await budgetKernel.send(.prompt(PromptInput(text: "预算内"))); return () }
+let budgetAllowed = try! awaitValue { () async throws -> Bool in
+  for _ in 0..<150 {
+    if budgetClient.promptCount == 1 { return true }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return false
+}
+expect(budgetAllowed, "预算未超限时 prompt 必须正常放行")
+unsetenv("KIMI_AGENT_BUDGET_USD")
+// The scripted idle lands ~20ms after subscribe; wait for the harness lane to
+// fully settle so the next prompt is not rejected as laneBusy.
+try! awaitValue { try await Task.sleep(for: .milliseconds(400)); return () }
+try! awaitValue { try await budgetKernel.send(.prompt(PromptInput(text: "无预算配置"))); return () }
+let budgetUnsetAllowed = try! awaitValue { () async throws -> Bool in
+  for _ in 0..<150 {
+    if budgetClient.promptCount == 2 { return true }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return false
+}
+expect(budgetUnsetAllowed, "未设置 KIMI_AGENT_BUDGET_USD 时预算闸必须完全不拦截")
 
 // P0 steer 泵：运行中的 turn 必须把 harness 队列里的 steering 转发给引擎
 let steerClient = SteerScriptKimiRuntimeClient()
@@ -4123,5 +4524,124 @@ expect(!cleanedTerminal.contains("\u{7}"), "终端输出必须移除 BEL 控制�
 expect(cleanedTerminal.contains("user@mac ~ % ok"), "终端清洗必须保留可见文本")
 expect(cleanedTerminal.contains("finished"), "回车符必须表现为行内覆盖而不是残留控制字符")
 expect(cleanedTerminal.contains("progress: 100%"), "退格键必须表现为删除前一个字符")
+
+// MARK: - Failure surfacing & retry (可靠性回归)
+
+// 引擎事件流在完成前中断：Harness 失败必须传播为用户可见错误
+let dyingClient = DyingStreamKimiRuntimeClient()
+let dyingKernel = KimiAppKernel(sessionClient: dyingClient)
+try! awaitValue { try await dyingKernel.send(.createSession(directory: "/tmp/dying")); return () }
+try! awaitValue { try await dyingKernel.send(.prompt(PromptInput(text: "会失败的任务"))); return () }
+let dyingError = try! awaitValue { () async throws -> String? in
+  for _ in 0..<150 {
+    if let error = await dyingKernel.snapshot().lastError { return error }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return nil
+}
+expect(dyingError != nil, "引擎事件流中途结束时，Harness 失败必须传播为用户可见错误而不是永久等待")
+
+// 失败可重试：retry 必须用失败 operation 的原 prompt 重新发起一轮
+try! awaitValue { await dyingKernel.retryLastFailure() }
+let retryDelivered = try! awaitValue { () async throws -> Bool in
+  for _ in 0..<150 {
+    if dyingClient.promptTrace.snapshot.filter({ $0 == "会失败的任务" }).count >= 2 { return true }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return false
+}
+expect(retryDelivered, "retry 必须重新投递失败任务的原始 prompt，而不是只清空错误横幅")
+
+// 没有失败任务时 retry 必须是 no-op（streamingKernel 的 turn 已成功完成）
+try! awaitValue { await streamingKernel.retryLastFailure(); return () }
+let afterNoopRetry = try! awaitValue { await streamingKernel.snapshot() }
+expect(afterNoopRetry.lastError == nil, "没有失败任务时 retry 不得制造新错误")
+
+// restartRuntime 无 supervisor 时必须诚实报错，不得谎报 ready
+let noEngineKernel = KimiAppKernel()
+try! awaitValue { try await noEngineKernel.send(.restartRuntime); return () }
+let noEngineState = try! awaitValue { await noEngineKernel.snapshot() }
+expect(noEngineState.runtimeState == .failed, "引擎未打包时 restartRuntime 必须标记 failed，不得谎报 ready")
+expect(noEngineState.lastError != nil, "引擎未打包时 restartRuntime 必须给出用户可见错误")
+
+// prompt 同步失败：必须抛错、上屏，且不得留下看似已送达的用户气泡
+let unavailableKernel = KimiAppKernel()
+let promptThrew = try! awaitValue { () async throws -> Bool in
+  do {
+    try await unavailableKernel.send(.prompt(PromptInput(text: "你好")))
+    return false
+  } catch {
+    return true
+  }
+}
+expect(promptThrew, "引擎不可用时 prompt 必须抛错，不得静默吞掉")
+let unavailableState = try! awaitValue { await unavailableKernel.snapshot() }
+expect(unavailableState.messages.isEmpty, "发送失败时不得保留看似已送达的用户气泡")
+expect(unavailableState.lastError != nil, "发送失败必须写入 lastError 供 UI 展示")
+
+// Worktree 隔离:会话级 worktree 的目录/分支命名遵循 .kimi/worktrees/<id> 惯例
+let worktreeSessionID = UUID()
+let worktreeLocation = GitWorktreeManager.sessionWorktreeLocation(
+  repositoryRoot: URL(fileURLWithPath: "/tmp/demo-repo", isDirectory: true),
+  sessionID: worktreeSessionID
+)
+let expectedShortID = String(worktreeSessionID.uuidString.prefix(8)).lowercased()
+expect(worktreeLocation.directory.path == "/tmp/demo-repo/.kimi/worktrees/\(expectedShortID)", "会话 worktree 必须位于 <repo>/.kimi/worktrees/<session-id 前 8 位>")
+expect(worktreeLocation.branch == "kimi/session-\(expectedShortID)", "会话 worktree 分支必须为 kimi/session-<id>")
+
+// 旧持久化数据兼容:没有 worktreePath/worktreeBranch 键的会话摘要必须能解码,
+// workingPath 回退到 projectPath;绑定 worktree 后 workingPath 指向 worktree。
+let legacySessionJSON = #"{"id":"\#(UUID().uuidString)","title":"旧会话","projectPath":"/tmp/demo","status":"idle","updatedAt":0,"isScratch":false}"#
+let legacySession = try! JSONDecoder().decode(KimiSessionSummary.self, from: Data(legacySessionJSON.utf8))
+expect(legacySession.worktreePath == nil && legacySession.worktreeBranch == nil, "旧数据不得解出 worktree 字段")
+expect(legacySession.workingPath == "/tmp/demo", "无 worktree 时 workingPath 必须回退项目根")
+let worktreeSession = KimiSessionSummary(projectPath: "/tmp/demo", worktreePath: "/tmp/demo/.kimi/worktrees/a1b2c3d4", worktreeBranch: "kimi/session-a1b2c3d4")
+expect(worktreeSession.workingPath == "/tmp/demo/.kimi/worktrees/a1b2c3d4", "绑定 worktree 后 workingPath 必须指向 worktree")
+
+// 侧聊状态不持久化:编码不含 sideChat;持久化的 sideChatRuntimeIDs 能解码回来,
+// 供启动时清理引擎侧遗留的临时会话。
+let sideChatUIState = KimiUIState(
+  sideChat: KimiSideChatState(sessionRuntimeID: "ses_side", parentRuntimeID: "ses_main"),
+  sideChatRuntimeIDs: ["ses_side"]
+)
+let encodedUIState = try! JSONEncoder().encode(sideChatUIState)
+let decodedUIState = try! JSONDecoder().decode(KimiUIState.self, from: encodedUIState)
+expect(decodedUIState.sideChat == nil, "侧聊线程不得持久化,重启后恒为 nil")
+expect(decodedUIState.sideChatRuntimeIDs == ["ses_side"], "侧聊引擎会话 ID 必须持久化以便启动时清理")
+
+// 浏览器预览支撑:dev server 计划检测(package.json scripts + lockfile 推断包管理器)。
+let devServerFixture = FileManager.default.temporaryDirectory
+  .appendingPathComponent("kimi-devserver-\(UUID().uuidString)", isDirectory: true)
+try! FileManager.default.createDirectory(at: devServerFixture, withIntermediateDirectories: true)
+try! #"{"scripts":{"dev":"vite","build":"vite build"}}"#
+  .write(to: devServerFixture.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+let npmPlan = KimiBrowserPreviewSupport.devServerPlan(forProjectRoot: devServerFixture)
+expect(npmPlan == KimiDevServerPlan(packageManager: "npm", script: "dev"), "有 dev 脚本且无 lockfile 时必须选择 npm run dev")
+try! Data().write(to: devServerFixture.appendingPathComponent("pnpm-lock.yaml"))
+let pnpmPlan = KimiBrowserPreviewSupport.devServerPlan(forProjectRoot: devServerFixture)
+expect(pnpmPlan?.packageManager == "pnpm", "存在 pnpm-lock.yaml 时必须使用 pnpm")
+try! #"{"scripts":{"start":"next start"}}"#
+  .write(to: devServerFixture.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+let startPlan = KimiBrowserPreviewSupport.devServerPlan(forProjectRoot: devServerFixture)
+expect(startPlan?.script == "start", "无 dev 脚本时必须回退 start 脚本")
+try! #"{"scripts":{"build":"tsc"}}"#
+  .write(to: devServerFixture.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+expect(KimiBrowserPreviewSupport.devServerPlan(forProjectRoot: devServerFixture) == nil, "无 dev/start 脚本时不得生成启动计划")
+expect(npmPlan?.command.arguments == ["npm", "run", "dev"], "启动计划命令必须经由 /usr/bin/env 运行包管理器")
+try? FileManager.default.removeItem(at: devServerFixture)
+
+// dev server 输出的本地地址提取:只认 localhost / 127.0.0.1。
+let viteOutput = "VITE v5.0.0  ready in 321 ms\n\n  ➜  Local:   http://localhost:5173/\n  ➜  Network: http://192.168.1.5:5173/"
+expect(KimiBrowserPreviewSupport.extractLocalURL(from: viteOutput)?.absoluteString == "http://localhost:5173/", "必须提取首个 localhost 地址而忽略局域网地址")
+expect(KimiBrowserPreviewSupport.extractLocalURL(from: "Server running at http://127.0.0.1:8080/index.html.")?.absoluteString == "http://127.0.0.1:8080/index.html", "127.0.0.1 地址必须被提取且去掉尾随标点")
+expect(KimiBrowserPreviewSupport.extractLocalURL(from: "see https://example.com/docs") == nil, "非环回地址不得被当作 dev server 地址")
+
+// 浏览器面板可预览的本地文件类型:HTML/PDF/图片/视频。
+expect(KimiBrowserPreviewSupport.isBrowserPreviewableFile(URL(fileURLWithPath: "/tmp/a/index.html")), "HTML 必须可在浏览器面板预览")
+expect(KimiBrowserPreviewSupport.isBrowserPreviewableFile(URL(fileURLWithPath: "/tmp/a/report.PDF")), "PDF(大小写不敏感)必须可在浏览器面板预览")
+expect(KimiBrowserPreviewSupport.isBrowserPreviewableFile(URL(fileURLWithPath: "/tmp/a/shot.png")), "图片必须可在浏览器面板预览")
+expect(KimiBrowserPreviewSupport.isBrowserPreviewableFile(URL(fileURLWithPath: "/tmp/a/demo.mp4")), "视频必须可在浏览器面板预览")
+expect(!KimiBrowserPreviewSupport.isBrowserPreviewableFile(URL(fileURLWithPath: "/tmp/a/main.swift")), "源代码文件不得在浏览器面板预览")
+expect(!KimiBrowserPreviewSupport.isBrowserPreviewableFile(URL(fileURLWithPath: "/tmp/a/notes.txt")), "纯文本文件不得在浏览器面板预览")
 
 print("KimiAgentCore checks passed")

@@ -148,6 +148,7 @@ public final class KimiRuntimeEventDecoder: @unchecked Sendable {
     // carry no text part (they never produce a chat bubble), and the role
     // registry keeps later text parts of user messages out of the assistant
     // stream.
+    var usagePayload: [String: String] = [:]
     if loweredType == "message.updated",
        let info = properties["info"] as? [String: Any] {
       let role = (info["role"] as? String)?.lowercased()
@@ -159,6 +160,18 @@ public final class KimiRuntimeEventDecoder: @unchecked Sendable {
           kind: .userText,
           messageID: messageID
         )
+      }
+      // Assistant message.updated carries the turn's token usage and cost in
+      // info.tokens / info.cost; forward them through the payload so Harness
+      // accounting can settle the turn without changing the event kind.
+      if role == "assistant" {
+        messageID = messageID ?? info["id"] as? String
+        if let tokens = info["tokens"] as? [String: Any], let encoded = Self.stringify(tokens) {
+          usagePayload["usageTokens"] = encoded
+        }
+        if let cost = Self.numberString(info["cost"]) {
+          usagePayload["usageCost"] = cost
+        }
       }
     }
 
@@ -249,6 +262,7 @@ public final class KimiRuntimeEventDecoder: @unchecked Sendable {
     if let status = partState?["status"] as? String { payload["status"] = status }
     if let statusType = (properties["status"] as? [String: Any])?["type"] as? String { payload["statusType"] = statusType }
     if let error = properties["error"] { payload["error"] = Self.stringify(error) ?? "error" }
+    for (key, value) in usagePayload where payload[key] == nil { payload[key] = value }
     // opencode signals turn completion through two different wire shapes
     // (a dedicated session.idle event, or a session.status frame whose
     // statusType is "idle"); translate both into the one explicit contract
@@ -306,6 +320,16 @@ public final class KimiRuntimeEventDecoder: @unchecked Sendable {
     guard JSONSerialization.isValidJSONObject(value),
           let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) else { return nil }
     return String(data: data, encoding: .utf8)
+  }
+
+  /// Renders a JSON number (Int or Double after JSONSerialization) as a plain
+  /// decimal string; anything else is dropped rather than guessed.
+  static func numberString(_ value: Any?) -> String? {
+    switch value {
+    case let number as NSNumber: return number.stringValue
+    case let string as String: return string
+    default: return nil
+    }
   }
 
   static func mapKind(_ raw: String) -> KimiRuntimeEventKind {
@@ -378,13 +402,20 @@ public enum KimiRuntimeEventBridge {
         ))
       ]
     case .permissionAsked:
+      // edit/write 工具的 permission.asked metadata 携带 {filepath, diff}
+      //（见 vendor engine tool/edit.ts、tool/write.ts 的 ctx.ask 调用点），
+      // 透传给权限卡做批准前的改动预览。
+      let metadata = Self.decodeJSONObject(event.payload["metadata"])
       return [
         .permission(KimiPermissionRequest(
           id: event.id,
           runtimeID: event.requestID,
           toolID: event.toolID ?? "unknown",
           reason: event.text ?? "需要确认工具操作。",
-          patterns: Self.decodeStringArray(event.payload["patterns"])
+          patterns: Self.decodeStringArray(event.payload["patterns"]),
+          sessionRuntimeID: event.sessionID,
+          metadataFilePath: metadata?["filepath"] as? String,
+          metadataDiff: metadata?["diff"] as? String
         ))
       ]
     case .todoUpdated:
@@ -431,6 +462,12 @@ public enum KimiRuntimeEventBridge {
           let data = raw.data(using: .utf8),
           let array = try? JSONSerialization.jsonObject(with: data) as? [Any] else { return [] }
     return array.compactMap { $0 as? String }
+  }
+
+  static func decodeJSONObject(_ raw: String?) -> [String: Any]? {
+    guard let raw,
+          let data = raw.data(using: .utf8) else { return nil }
+    return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
   }
 
   static func decodeTodos(_ raw: String?) -> [KimiTodoItem] {

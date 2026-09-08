@@ -64,6 +64,10 @@ struct KimiSettingsView: View {
           switch selectedCategory {
           case .account:
             KimiAccountSettingsPane(model: model, pending: pending)
+          case .appearance:
+            KimiAppearanceSettingsPane(model: model)
+          case .session:
+            KimiSessionSettingsPane(model: model)
           case .mcp:
             KimiMCPSettingsPane(model: model)
           case .hooks:

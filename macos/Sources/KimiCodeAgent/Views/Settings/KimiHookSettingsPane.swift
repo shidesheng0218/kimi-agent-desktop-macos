@@ -13,6 +13,7 @@ import KimiAgentCore
 struct KimiHookSettingsPane: View {
   @ObservedObject var pending: PendingSettingsChanges
 
+  @AppStorage("kimi.notifications.enabled") private var notificationsEnabled = true
   @State private var systemPromptRules: [String] = []
   @State private var newRuleText = ""
   @State private var permissionOverrides: [String: KimiHookPermissionOverride] = [:]
@@ -38,6 +39,7 @@ struct KimiHookSettingsPane: View {
         .foregroundStyle(KimiDesign.muted)
       ScrollView {
         VStack(alignment: .leading, spacing: 22) {
+          notificationSection
           systemPromptSection
           permissionSection
           webFetchSection
@@ -47,6 +49,20 @@ struct KimiHookSettingsPane: View {
       .frame(maxHeight: KimiSettingsLayout.maxScrollHeight)
     }
     .task { load() }
+  }
+
+  // MARK: - 系统通知
+
+  private var notificationSection: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      sectionTitle("系统通知", systemImage: "bell")
+      Text("会话执行完成或出现新的待审批操作时发送系统通知（仅当该会话不在当前视图或应用不在前台）。点击通知会跳转到对应会话。此开关立即生效，无需“应用更改”。")
+        .font(.caption)
+        .foregroundStyle(KimiDesign.muted)
+      Toggle("启用系统通知", isOn: $notificationsEnabled)
+        .toggleStyle(.checkbox)
+        .font(.subheadline)
+    }
   }
 
   // MARK: - System prompt rules

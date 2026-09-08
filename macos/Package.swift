@@ -33,6 +33,7 @@ let package = Package(
     .executableTarget(name: "KimiAgentCoreChecks", dependencies: ["KimiAgentCore"]),
     .executableTarget(name: "BrowserSmokeCheck", dependencies: ["KimiAgentCore"]),
     .executableTarget(name: "ComputerUseSmokeCheck", dependencies: ["KimiAgentCore"]),
-    .executableTarget(name: "RestartRecoveryCheck", dependencies: ["KimiAgentCore"])
+    .executableTarget(name: "RestartRecoveryCheck", dependencies: ["KimiAgentCore"]),
+    .testTarget(name: "KimiAgentCoreTests", dependencies: ["KimiAgentCore"])
   ]
 )

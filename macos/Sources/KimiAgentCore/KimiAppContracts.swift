@@ -33,9 +33,22 @@ public enum KimiAppCommand: Sendable, Equatable {
   case openDiff(UUID)
   case openBrowser(UUID)
   case openFile(String)
+  /// 打开纯本地投影的辅助面板（验证/集成/后台任务）。必须经 kernel 置位
+  /// activePane:ViewModel 本地置位会被下一次事件快照刷新冲掉。
+  case openAuxPane(KimiActivePane)
   case changeModel(String)
   case changeThinkingEffort(String)
   case restartRuntime
+  /// 删除会话(引擎 DELETE /session/:id + 本地移除)。worktree 的清理
+  /// 由 ViewModel 在用户确认后单独执行(见 KimiAppViewModel.confirmDeleteSession)。
+  case deleteSession(UUID)
+  /// 打开当前会话的侧聊:fork 出一条临时会话,携带主会话完整上下文。
+  case openSideChat
+  /// 关闭侧聊并删除引擎侧临时会话。
+  case closeSideChat
+  /// 侧聊发消息(纯文本)。不经过 Harness 主通道,直接驱动侧聊 fork 会话。
+  case sideChatPrompt(String)
+  case sideChatAbort
 
   public enum Kind: String, Codable, Sendable {
     case createSession
@@ -62,9 +75,15 @@ public enum KimiAppCommand: Sendable, Equatable {
     case openDiff
     case openBrowser
     case openFile
+    case openAuxPane
     case changeModel
     case changeThinkingEffort
     case restartRuntime
+    case deleteSession
+    case openSideChat
+    case closeSideChat
+    case sideChatPrompt
+    case sideChatAbort
   }
 
   public var kind: Kind {
@@ -93,9 +112,15 @@ public enum KimiAppCommand: Sendable, Equatable {
     case .openDiff: .openDiff
     case .openBrowser: .openBrowser
     case .openFile: .openFile
+    case .openAuxPane: .openAuxPane
     case .changeModel: .changeModel
     case .changeThinkingEffort: .changeThinkingEffort
     case .restartRuntime: .restartRuntime
+    case .deleteSession: .deleteSession
+    case .openSideChat: .openSideChat
+    case .closeSideChat: .closeSideChat
+    case .sideChatPrompt: .sideChatPrompt
+    case .sideChatAbort: .sideChatAbort
     }
   }
 }
@@ -107,6 +132,7 @@ public enum KimiActivePane: String, Codable, Sendable {
   case files
   case verification
   case integrations
+  case tasks
 }
 
 public enum KimiTerminalPlacement: String, Codable, Sendable {
@@ -142,6 +168,14 @@ public struct KimiSessionSummary: Codable, Equatable, Identifiable, Sendable {
   /// session cannot become a project session or vice versa, so its directory
   /// binding is always what the user (or lack thereof) expects.
   public var isScratch: Bool = false
+  /// 会话绑定的 git worktree 目录（开启「新会话使用独立工作区」且项目是可
+  /// 用 git 仓库时，位于 <repo>/.kimi/worktrees/<id>）；nil 表示会话直接
+  /// 运行在 projectPath。projectPath 始终保持项目根，用于侧栏分组与最近项目。
+  public var worktreePath: String? = nil
+  /// worktree 分支名（kimi/session-<id>），侧栏徽标展示。
+  public var worktreeBranch: String? = nil
+  /// 会话实际工作目录：引擎调用、diff、文件面板、终端统一走这里。
+  public var workingPath: String? { worktreePath ?? projectPath }
 
   public init(
     id: UUID = UUID(),
@@ -151,7 +185,9 @@ public struct KimiSessionSummary: Codable, Equatable, Identifiable, Sendable {
     status: SessionStatus = .idle,
     updatedAt: Date = .now,
     parentRuntimeID: String? = nil,
-    isScratch: Bool = false
+    isScratch: Bool = false,
+    worktreePath: String? = nil,
+    worktreeBranch: String? = nil
   ) {
     self.id = id
     self.runtimeID = runtimeID
@@ -161,6 +197,8 @@ public struct KimiSessionSummary: Codable, Equatable, Identifiable, Sendable {
     self.updatedAt = updatedAt
     self.parentRuntimeID = parentRuntimeID
     self.isScratch = isScratch
+    self.worktreePath = worktreePath
+    self.worktreeBranch = worktreeBranch
   }
 }
 
@@ -188,6 +226,9 @@ public struct KimiMessage: Codable, Equatable, Identifiable, Sendable {
   /// `fetchMessages`. Needed to fork a session from a specific message via
   /// POST /session/:id/fork, which takes an engine messageID.
   public let runtimeMessageID: String?
+  /// 用户消息携带的附件（图片缩略图 / 文件 chip），用于时间线展示；
+  /// 助手消息恒为空。
+  public var attachments: [KimiPromptAttachment]
   public let createdAt: Date
 
   public init(
@@ -197,6 +238,7 @@ public struct KimiMessage: Codable, Equatable, Identifiable, Sendable {
     isStreaming: Bool = false,
     runtimePartID: String? = nil,
     runtimeMessageID: String? = nil,
+    attachments: [KimiPromptAttachment] = [],
     createdAt: Date = .now
   ) {
     self.id = id
@@ -205,7 +247,28 @@ public struct KimiMessage: Codable, Equatable, Identifiable, Sendable {
     self.isStreaming = isStreaming
     self.runtimePartID = runtimePartID
     self.runtimeMessageID = runtimeMessageID
+    self.attachments = attachments
     self.createdAt = createdAt
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case id, role, text, isStreaming, runtimePartID, runtimeMessageID, attachments, createdAt
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      id: try container.decode(UUID.self, forKey: .id),
+      role: try container.decode(KimiMessageRole.self, forKey: .role),
+      text: try container.decode(String.self, forKey: .text),
+      isStreaming: try container.decode(Bool.self, forKey: .isStreaming),
+      runtimePartID: try container.decodeIfPresent(String.self, forKey: .runtimePartID),
+      runtimeMessageID: try container.decodeIfPresent(String.self, forKey: .runtimeMessageID),
+      // 旧持久化状态没有 attachments 键；decodeIfPresent 缺失时回落为空，
+      // 避免整个消息数组因单条解码失败被丢弃。
+      attachments: try container.decodeIfPresent([KimiPromptAttachment].self, forKey: .attachments) ?? [],
+      createdAt: try container.decode(Date.self, forKey: .createdAt)
+    )
   }
 }
 
@@ -259,18 +322,27 @@ public struct KimiPermissionRequest: Codable, Equatable, Identifiable, Sendable 
   public let reason: String
   public let patterns: [String]
   public let createdAt: Date
+  /// 该权限请求所属的引擎会话 ID，用于系统通知定位会话；旧持久化数据没有此字段。
+  public let sessionRuntimeID: String?
+  /// edit/write 类权限请求 metadata 里的目标文件路径（引擎下发，绝对路径）。
+  public let metadataFilePath: String?
+  /// edit/write 类权限请求 metadata 里的待写入 unified diff，用于权限卡内嵌预览。
+  public let metadataDiff: String?
 
-  public init(id: UUID = UUID(), runtimeID: String? = nil, toolID: String, reason: String, patterns: [String] = [], createdAt: Date = .now) {
+  public init(id: UUID = UUID(), runtimeID: String? = nil, toolID: String, reason: String, patterns: [String] = [], createdAt: Date = .now, sessionRuntimeID: String? = nil, metadataFilePath: String? = nil, metadataDiff: String? = nil) {
     self.id = id
     self.runtimeID = runtimeID
     self.toolID = toolID
     self.reason = reason
     self.patterns = patterns
     self.createdAt = createdAt
+    self.sessionRuntimeID = sessionRuntimeID
+    self.metadataFilePath = metadataFilePath
+    self.metadataDiff = metadataDiff
   }
 
   private enum CodingKeys: String, CodingKey {
-    case id, runtimeID, toolID, reason, patterns, createdAt
+    case id, runtimeID, toolID, reason, patterns, createdAt, sessionRuntimeID, metadataFilePath, metadataDiff
   }
 
   public init(from decoder: Decoder) throws {
@@ -281,7 +353,10 @@ public struct KimiPermissionRequest: Codable, Equatable, Identifiable, Sendable 
       toolID: try container.decode(String.self, forKey: .toolID),
       reason: try container.decode(String.self, forKey: .reason),
       patterns: try container.decodeIfPresent([String].self, forKey: .patterns) ?? [],
-      createdAt: try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
+      createdAt: try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now,
+      sessionRuntimeID: try container.decodeIfPresent(String.self, forKey: .sessionRuntimeID),
+      metadataFilePath: try container.decodeIfPresent(String.self, forKey: .metadataFilePath),
+      metadataDiff: try container.decodeIfPresent(String.self, forKey: .metadataDiff)
     )
   }
 }
@@ -430,6 +505,38 @@ public struct KimiIntegrationStatus: Equatable, Sendable {
   }
 }
 
+/// 侧聊(⌘;)的迷你对话线程:主会话的一条临时 fork,能读到主会话上下文
+/// 但不写入主会话历史;关闭面板时删除引擎侧临时会话。只发文本,不支持附件。
+/// 不持久化(见 KimiUIState 的 CodingKeys):应用重启后由
+/// KimiAppKernel.cleanupOrphanSideChats 清理引擎侧遗留会话。
+public struct KimiSideChatState: Codable, Equatable, Sendable {
+  /// 侧聊 fork 会话的引擎 ID(ses_...)。
+  public var sessionRuntimeID: String
+  /// 主会话的引擎 ID,侧聊由此 fork。
+  public var parentRuntimeID: String
+  /// 侧聊会话的工作目录(与主会话一致,可能是 worktree)。
+  public var directory: String?
+  public var messages: [KimiMessage]
+  public var busy: Bool
+  public var error: String?
+
+  public init(
+    sessionRuntimeID: String,
+    parentRuntimeID: String,
+    directory: String? = nil,
+    messages: [KimiMessage] = [],
+    busy: Bool = false,
+    error: String? = nil
+  ) {
+    self.sessionRuntimeID = sessionRuntimeID
+    self.parentRuntimeID = parentRuntimeID
+    self.directory = directory
+    self.messages = messages
+    self.busy = busy
+    self.error = error
+  }
+}
+
 public struct KimiUIState: Codable, Equatable, Sendable {
   public var activePane: KimiActivePane
   public let terminalPlacement: KimiTerminalPlacement
@@ -464,6 +571,12 @@ public struct KimiUIState: Codable, Equatable, Sendable {
   /// Engine message ID of the last user message per runtime session; revert
   /// targets it to roll back the latest turn's file changes.
   public var lastUserMessageIDBySession: [String: String]
+  /// 当前打开的侧聊线程(⌘;)。不持久化:随应用退出失效,引擎侧遗留会话
+  /// 由下次启动时的 cleanupOrphanSideChats 依 sideChatRuntimeIDs 清理。
+  public var sideChat: KimiSideChatState?
+  /// 全部侧聊临时会话的引擎 ID(含已关闭未清理成功的)。持久化,用于
+  /// 启动时从引擎会话列表里过滤/删除,避免侧聊出现在侧栏。
+  public var sideChatRuntimeIDs: [String]
 
   public init(
     activePane: KimiActivePane = .conversation,
@@ -485,7 +598,9 @@ public struct KimiUIState: Codable, Equatable, Sendable {
     pendingQuestions: [KimiQuestionRequest] = [],
     availableCommands: [KimiSlashCommand] = [],
     revertedSessionIDs: [String] = [],
-    lastUserMessageIDBySession: [String: String] = [:]
+    lastUserMessageIDBySession: [String: String] = [:],
+    sideChat: KimiSideChatState? = nil,
+    sideChatRuntimeIDs: [String] = []
   ) {
     self.activePane = activePane
     self.terminalPlacement = terminalPlacement
@@ -507,6 +622,8 @@ public struct KimiUIState: Codable, Equatable, Sendable {
     self.availableCommands = availableCommands
     self.revertedSessionIDs = revertedSessionIDs
     self.lastUserMessageIDBySession = lastUserMessageIDBySession
+    self.sideChat = sideChat
+    self.sideChatRuntimeIDs = sideChatRuntimeIDs
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -530,6 +647,9 @@ public struct KimiUIState: Codable, Equatable, Sendable {
     case availableCommands
     case revertedSessionIDs
     case lastUserMessageIDBySession
+    // sideChat 刻意不在 CodingKeys 里:侧聊线程是会话级的临时状态,
+    // 既不编码也不解码,重启后恒为 nil。
+    case sideChatRuntimeIDs
   }
 
   public init(from decoder: Decoder) throws {
@@ -561,6 +681,8 @@ public struct KimiUIState: Codable, Equatable, Sendable {
     availableCommands = try container.decodeIfPresent([KimiSlashCommand].self, forKey: .availableCommands) ?? []
     revertedSessionIDs = try container.decodeIfPresent([String].self, forKey: .revertedSessionIDs) ?? []
     lastUserMessageIDBySession = try container.decodeIfPresent([String: String].self, forKey: .lastUserMessageIDBySession) ?? [:]
+    sideChat = nil
+    sideChatRuntimeIDs = try container.decodeIfPresent([String].self, forKey: .sideChatRuntimeIDs) ?? []
   }
 }
 
@@ -592,6 +714,12 @@ public enum KimiEvent: Sendable, Equatable {
   case activity(KimiActivity)
   case permission(KimiPermissionRequest)
   case error(String)
+  /// 侧聊线程状态变化(打开/关闭/新消息/忙碌翻转),仅作刷新信号,
+  /// apply 不改动主会话时间线。
+  case sideChatUpdated
+  /// 非活跃会话的原始引擎事件直通(双会话分屏的次会话列据此维护自己的
+  /// 时间线)。只发布、不进 apply:主时间线只承载活跃会话。
+  case sessionEvent(EngineRuntimeEvent)
 
   public var displayText: String {
     switch self {
@@ -608,6 +736,19 @@ public enum KimiEvent: Sendable, Equatable {
     case let .questionSettled(requestID): return "问题已结算：\(requestID)"
     case let .activity(activity): return activity.title
     case let .permission(permission): return permission.reason
+    case .sideChatUpdated: return "侧聊更新"
+    case let .sessionEvent(event): return "\(event.sessionID):\(event.kind.rawValue)"
+    }
+  }
+
+  /// 该事件是否写入主会话时间线(state.messages/activities/todos)。
+  /// 非活跃会话的这类事件被 ingest 过滤,改走 .sessionEvent 直通。
+  var targetsActiveTimeline: Bool {
+    switch self {
+    case .userText, .assistantText, .reasoningText, .activity, .todoUpdated:
+      return true
+    default:
+      return false
     }
   }
 }

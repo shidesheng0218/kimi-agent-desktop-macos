@@ -208,12 +208,17 @@ public struct UsageLedgerEntry: Codable, Equatable, Sendable, Identifiable {
   public let estimatedCost: Decimal
   public let pricingStatus: UsageCostStatus
   public let qualityScore: Double?
+  /// Runtime session ID (`ses_...`) the turn ran in. Optional and absent in
+  /// entries written before this field existed — those simply don't
+  /// attribute to any session in per-session rollups.
+  public let sessionID: String?
   public let createdAt: Date
 
   public init(
     id: UUID = UUID(), operationID: UUID, stage: AgentKind, provider: String, model: String,
     inputTokens: Int, outputTokens: Int, cachedTokens: Int = 0, latencyMS: Int,
-    estimatedCost: Decimal, qualityScore: Double?, pricingStatus: UsageCostStatus = .calculated, createdAt: Date = .now
+    estimatedCost: Decimal, qualityScore: Double?, pricingStatus: UsageCostStatus = .calculated,
+    sessionID: String? = nil, createdAt: Date = .now
   ) {
     self.id = id
     self.operationID = operationID
@@ -227,11 +232,12 @@ public struct UsageLedgerEntry: Codable, Equatable, Sendable, Identifiable {
     self.estimatedCost = max(0, estimatedCost)
     self.pricingStatus = pricingStatus
     self.qualityScore = qualityScore.map { min(max($0, 0), 1) }
+    self.sessionID = sessionID
     self.createdAt = createdAt
   }
 
   private enum CodingKeys: String, CodingKey {
-    case id, operationID, stage, provider, model, inputTokens, outputTokens, cachedTokens, latencyMS, estimatedCost, pricingStatus, qualityScore, createdAt
+    case id, operationID, stage, provider, model, inputTokens, outputTokens, cachedTokens, latencyMS, estimatedCost, pricingStatus, qualityScore, sessionID, createdAt
   }
 
   public init(from decoder: Decoder) throws {
@@ -249,6 +255,7 @@ public struct UsageLedgerEntry: Codable, Equatable, Sendable, Identifiable {
       estimatedCost: try container.decodeIfPresent(Decimal.self, forKey: .estimatedCost) ?? 0,
       qualityScore: try container.decodeIfPresent(Double.self, forKey: .qualityScore),
       pricingStatus: try container.decodeIfPresent(UsageCostStatus.self, forKey: .pricingStatus) ?? .calculated,
+      sessionID: try container.decodeIfPresent(String.self, forKey: .sessionID),
       createdAt: try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
     )
   }
@@ -291,6 +298,18 @@ public final class UsageLedger: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return entries.lazy.filter { operationID == nil || $0.operationID == operationID }.reduce(Decimal.zero) { $0 + $1.estimatedCost }
+  }
+
+  /// Per-session rollup for the conversation header. Entries written before
+  /// the sessionID field existed are simply not attributed to any session.
+  public func sessionUsage(sessionID: String) -> (tokens: Int, cost: Decimal)? {
+    lock.lock()
+    defer { lock.unlock() }
+    let matched = entries.filter { $0.sessionID == sessionID }
+    guard !matched.isEmpty else { return nil }
+    let tokens = matched.reduce(0) { $0 + $1.inputTokens + $1.outputTokens }
+    let cost = matched.reduce(Decimal.zero) { $0 + $1.estimatedCost }
+    return (tokens, cost)
   }
 
   public func contains(operationID: UUID) -> Bool {

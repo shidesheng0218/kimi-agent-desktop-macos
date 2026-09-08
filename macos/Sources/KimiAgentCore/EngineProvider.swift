@@ -39,12 +39,20 @@ public struct KimiRuntimePromptInput: Codable, Sendable {
   /// Per-prompt model override; the engine accepts a ModelRef in the prompt
   /// body, so switching models never requires a runtime restart.
   public let modelID: String?
+  /// 附件映射为引擎 FilePartInput（图片 data URL / 文件 file:// 引用），
+  /// 追加在 text part 之后；空数组时请求体与历史行为一致。
+  public let attachments: [KimiPromptAttachment]
+  /// prompt 级 agent 覆盖（引擎 PromptInput.agent，如 "plan"）；nil 时
+  /// 请求体与历史行为一致，引擎回落到默认 build agent。
+  public let agent: String?
 
-  public init(sessionID: String, text: String, directory: String? = nil, modelID: String? = nil) {
+  public init(sessionID: String, text: String, directory: String? = nil, modelID: String? = nil, attachments: [KimiPromptAttachment] = [], agent: String? = nil) {
     self.sessionID = sessionID
     self.text = text
     self.directory = directory
     self.modelID = modelID
+    self.attachments = attachments
+    self.agent = agent
   }
 }
 
@@ -87,8 +95,15 @@ public struct KimiRuntimeHistoryPart: Sendable, Equatable {
   public let callID: String?
   public let status: String?
   public let output: String?
+  /// file part 的展示字段：历史重建时把用户消息里的附件还原成缩略图/文件名 chip。
+  public let mime: String?
+  public let filename: String?
+  public let url: String?
+  /// 引擎为 file part 生成的合成文本（"Called the Read tool..."、文件内容），
+  /// 重建用户消息气泡时要排除，否则附件内容会灌进气泡正文。
+  public let synthetic: Bool
 
-  public init(partID: String, type: String, text: String? = nil, toolName: String? = nil, callID: String? = nil, status: String? = nil, output: String? = nil) {
+  public init(partID: String, type: String, text: String? = nil, toolName: String? = nil, callID: String? = nil, status: String? = nil, output: String? = nil, mime: String? = nil, filename: String? = nil, url: String? = nil, synthetic: Bool = false) {
     self.partID = partID
     self.type = type
     self.text = text
@@ -96,6 +111,10 @@ public struct KimiRuntimeHistoryPart: Sendable, Equatable {
     self.callID = callID
     self.status = status
     self.output = output
+    self.mime = mime
+    self.filename = filename
+    self.url = url
+    self.synthetic = synthetic
   }
 }
 
@@ -161,6 +180,13 @@ public protocol EngineProvider: Sendable {
   /// state after an event-stream reconnect where a completion frame may have
   /// been missed.
   func fetchSessionStatuses(directory: String?) async throws -> [String: String]
+  /// Runtime per-session permission ruleset (PATCH /session/:id). The engine
+  /// merges it after the agent-level rules and evaluates last-match-wins, so
+  /// these rules override the launch-time config without an engine restart.
+  func updateSessionPermission(sessionID: String, ruleset: [KimiPermissionRule], directory: String?) async throws
+  /// 删除会话及其全部历史(DELETE /session/:id),用于会话删除与侧聊临时
+  /// 会话清理。
+  func deleteSession(sessionID: String, directory: String?) async throws
 }
 
 /// Convenience defaults keep scripted clients in checks and smoke targets
@@ -182,6 +208,10 @@ public extension EngineProvider {
   func addMCPServer(_ entry: KimiMCPServerEntry, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   func removeMCPServer(name: String, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
   func fetchSessionStatuses(directory: String?) async throws -> [String: String] { [:] }
+  /// 无权限门概念的 backend（如 Anthropic 直连）静默忽略；权限模式同步是
+  /// best-effort，失败只意味着回落到引擎默认的 ask 行为。
+  func updateSessionPermission(sessionID: String, ruleset: [KimiPermissionRule], directory: String?) async throws {}
+  func deleteSession(sessionID: String, directory: String?) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
 }
 
 public final class URLSessionRuntimeClient: EngineProvider, @unchecked Sendable {
@@ -223,11 +253,27 @@ public final class URLSessionRuntimeClient: EngineProvider, @unchecked Sendable 
   }
 
   public func prompt(_ input: KimiRuntimePromptInput) async throws {
-    var body: [String: Any] = [
-      "parts": [["type": "text", "text": input.text]]
-    ]
+    // 引擎 PromptInput schema：parts 为 TextPartInput | FilePartInput 的
+    // 判别联合（type 字段判别）。FilePartInput 的 url 支持 data:（base64）
+    // 与 file://（引擎端 Read 工具读取）两种协议，无需任何降级路径。
+    var parts: [[String: Any]] = []
+    if !input.text.isEmpty {
+      parts.append(["type": "text", "text": input.text])
+    }
+    for attachment in input.attachments {
+      parts.append([
+        "type": "file",
+        "mime": attachment.mime,
+        "url": attachment.url,
+        "filename": attachment.filename,
+      ])
+    }
+    var body: [String: Any] = ["parts": parts]
     if let modelID = input.modelID, !modelID.isEmpty {
       body["model"] = ["providerID": KimiRuntimeIdentityStore.providerID, "modelID": modelID]
+    }
+    if let agent = input.agent, !agent.isEmpty {
+      body["agent"] = agent
     }
     _ = try await requestData(
       path: "/session/\(input.sessionID)/prompt_async",
@@ -407,6 +453,20 @@ public final class URLSessionRuntimeClient: EngineProvider, @unchecked Sendable 
     return statuses
   }
 
+  public func updateSessionPermission(sessionID: String, ruleset: [KimiPermissionRule], directory: String?) async throws {
+    let rules: [[String: Any]] = ruleset.map { ["permission": $0.permission, "pattern": $0.pattern, "action": $0.action] }
+    _ = try await requestData(
+      path: "/session/\(sessionID)",
+      method: "PATCH",
+      query: directoryQuery(directory),
+      body: ["permission": rules]
+    )
+  }
+
+  public func deleteSession(sessionID: String, directory: String?) async throws {
+    _ = try await requestData(path: "/session/\(sessionID)", method: "DELETE", query: directoryQuery(directory), body: nil)
+  }
+
   static func parseHistoryMessage(_ object: [String: Any]) -> KimiRuntimeHistoryMessage? {
     guard let info = object["info"] as? [String: Any], let id = info["id"] as? String else { return nil }
     let role = info["role"] as? String ?? "assistant"
@@ -424,7 +484,11 @@ public final class URLSessionRuntimeClient: EngineProvider, @unchecked Sendable 
         toolName: part["tool"] as? String,
         callID: part["callID"] as? String,
         status: (part["state"] as? [String: Any])?["status"] as? String,
-        output: KimiRuntimeEventDecoder.stringify((part["state"] as? [String: Any])?["output"])
+        output: KimiRuntimeEventDecoder.stringify((part["state"] as? [String: Any])?["output"]),
+        mime: part["mime"] as? String,
+        filename: part["filename"] as? String,
+        url: part["url"] as? String,
+        synthetic: part["synthetic"] as? Bool ?? false
       )
     }
     return KimiRuntimeHistoryMessage(id: id, role: role, createdAt: createdAt, parts: parts)

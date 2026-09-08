@@ -14,7 +14,10 @@ import Foundation
 ///   not possible here. Callers should not assume steer always preempts.
 /// - Only a minimal tool set (read/write/shell, backed by the same native
 ///   primitives Terminal already uses) is wired up — this is not a second
-///   implementation of opencode's full tool catalog.
+///   implementation of opencode's full tool catalog. Tool execution is gated
+///   by `PermissionPolicy` fail-closed: without an approval-answer channel,
+///   anything that would need confirmation is refused outright, and shell
+///   commands that do pass run under the OS sandbox.
 /// - `forkSession`, `revert`/`unrevert`, MCP management, skills, and slash
 ///   commands are opencode-specific durable-session features with no
 ///   Anthropic-API equivalent; they use the protocol's throwing/empty
@@ -52,7 +55,15 @@ public final class AnthropicDirectEngineProvider: EngineProvider, @unchecked Sen
   public func prompt(_ input: KimiRuntimePromptInput) async throws {
     lock.withLock {
       var state = sessions[input.sessionID] ?? SessionState()
-      state.messages.append(AnthropicMessagesClient.Message(role: "user", content: [.text(input.text)]))
+      // 该后端只走纯文本 Messages API：图片 data URL 无法表达，文件引用
+      // 降级为绝对路径注入，由模型自行用工具读取。
+      var text = input.text
+      let references = input.attachments.filter { !$0.isDataURL }
+      if !references.isEmpty {
+        let lines = references.map { "- \($0.filename)：\(URL(string: $0.url)?.path ?? $0.url)" }.joined(separator: "\n")
+        text += "\n\n用户提供的附件文件（可用工具读取）：\n\(lines)"
+      }
+      state.messages.append(AnthropicMessagesClient.Message(role: "user", content: [.text(text)]))
       sessions[input.sessionID] = state
     }
   }
@@ -71,9 +82,9 @@ public final class AnthropicDirectEngineProvider: EngineProvider, @unchecked Sen
   }
 
   public func respondPermission(_ input: PermissionResponse) async throws {
-    // This backend never emits permissionAsked (its minimal tool set runs
-    // without an approval gate — see the module doc's scope note), so there
-    // is nothing to resolve here.
+    // This backend never emits permissionAsked: its tool gate fails closed on
+    // anything that would need an approval answer (see executeTool), so there
+    // is never a pending request to resolve here.
   }
 
   public func listSessions(directory: String?) async throws -> [KimiRuntimeSession] {
@@ -206,10 +217,21 @@ public final class AnthropicDirectEngineProvider: EngineProvider, @unchecked Sen
   private static func executeTool(name: String, inputJSON: String, directory: String?) -> (output: String, isError: Bool) {
     let input = (try? JSONSerialization.jsonObject(with: Data(inputJSON.utf8)) as? [String: Any]) ?? [:]
     let cwd = URL(fileURLWithPath: directory ?? FileManager.default.currentDirectoryPath, isDirectory: true)
+    let policy = PermissionPolicy(workspacePath: cwd.path)
+    // This provider has no approval-answer capability (respondPermission is a
+    // deliberate no-op), so the gate is fail-closed: anything short of an
+    // explicit allow is refused, and bash additionally runs under the OS
+    // sandbox if the policy ever does allow a command through.
+    func failClosed(_ action: String) -> (output: String, isError: Bool) {
+      ("已拒绝\(action)：该执行后端没有审批应答能力，凡需要确认的操作一律拒绝（fail-closed）。", true)
+    }
     switch name {
     case "read":
       guard let path = input["path"] as? String else { return ("read 缺少 path 参数。", true) }
       let url = URL(fileURLWithPath: path, relativeTo: cwd)
+      guard policy.decision(for: .readWorkspace, path: url.path) == .allow else {
+        return ("已拒绝读取工作区外文件：\(path)", true)
+      }
       guard let content = try? String(contentsOf: url, encoding: .utf8) else {
         return ("无法读取文件：\(path)", true)
       }
@@ -219,6 +241,9 @@ public final class AnthropicDirectEngineProvider: EngineProvider, @unchecked Sen
         return ("write 缺少 path 或 content 参数。", true)
       }
       let url = URL(fileURLWithPath: path, relativeTo: cwd)
+      guard policy.decision(for: .writeWorkspace, path: url.path) == .allow else {
+        return ("已拒绝写入工作区外文件：\(path)", true)
+      }
       do {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
@@ -228,12 +253,23 @@ public final class AnthropicDirectEngineProvider: EngineProvider, @unchecked Sen
       }
     case "bash":
       guard let command = input["command"] as? String else { return ("bash 缺少 command 参数。", true) }
-      do {
-        let result = try TerminalCommandRunner.run(command: command, cwd: cwd)
-        let combined = result.standardOutput + (result.standardError.isEmpty ? "" : "\n" + result.standardError)
-        return (combined, result.exitCode != 0)
-      } catch {
-        return ("命令执行失败：\(error.localizedDescription)", true)
+      switch policy.decision(for: .executeCommand, command: command) {
+      case .deny:
+        return ("已拒绝执行危险命令：\(command)", true)
+      case .ask:
+        return failClosed("执行命令 \(command)")
+      case .allow:
+        do {
+          let sandbox = TerminalSandboxConfiguration.strict(
+            workspaceURL: cwd,
+            scratchURL: FileManager.default.temporaryDirectory.appendingPathComponent("kimi-anthropic-direct-scratch", isDirectory: true)
+          )
+          let result = try TerminalCommandRunner.run(command: command, cwd: cwd, sandbox: sandbox)
+          let combined = result.standardOutput + (result.standardError.isEmpty ? "" : "\n" + result.standardError)
+          return (combined, result.exitCode != 0)
+        } catch {
+          return ("命令执行失败：\(error.localizedDescription)", true)
+        }
       }
     default:
       return ("未知工具：\(name)", true)

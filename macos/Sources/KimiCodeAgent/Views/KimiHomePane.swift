@@ -18,6 +18,10 @@ struct KimiHomePane: View {
     ScrollView {
       VStack(alignment: .leading, spacing: 22) {
         header
+        if let error = model.state.lastError {
+          errorBanner(error)
+        }
+        recentSessions
         controls
         if tab == .overview {
           statsGrid
@@ -73,6 +77,27 @@ struct KimiHomePane: View {
     }
     let name = NSFullUserName()
     return name.isEmpty ? "\(phase)，接下来做点什么？" : "\(phase)，\(name)"
+  }
+
+  // MARK: - Error banner
+
+  /// Engine/runtime failures must be visible on the home pane too — this is
+  /// where "开始新任务" lives, and a silent failure here previously read as
+  /// a dead button.
+  private func errorBanner(_ error: String) -> some View {
+    HStack(spacing: 10) {
+      Image(systemName: "exclamationmark.triangle.fill")
+        .foregroundStyle(.red)
+      Text(error)
+        .font(.subheadline)
+        .foregroundStyle(.red)
+        .frame(maxWidth: .infinity, alignment: .leading)
+      Button("重试", action: model.retryLastFailure)
+        .buttonStyle(.bordered)
+    }
+    .padding(12)
+    .background(Color.red.opacity(0.08))
+    .clipShape(RoundedRectangle(cornerRadius: 10))
   }
 
   // MARK: - Quick composer
@@ -307,7 +332,7 @@ struct KimiHomePane: View {
           .frame(maxWidth: .infinity, alignment: .center)
           .padding(.vertical, 24)
       } else {
-        ForEach(model.state.sessions.prefix(5)) { session in
+        ForEach(model.state.sessions.sorted { $0.updatedAt > $1.updatedAt }.prefix(5)) { session in
           Button { model.select(session.id) } label: {
             HStack(spacing: 12) {
               Circle()

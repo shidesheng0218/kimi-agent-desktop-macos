@@ -45,6 +45,55 @@ public struct FileDiff: Codable, Equatable, Identifiable, Sendable {
   }
 }
 
+public enum DiffRowKind: Equatable, Sendable {
+  case hunkHeader(String)
+  /// number 为行号：新增/上下文行用新侧行号，删除行用旧侧行号。
+  case line(number: Int, isDeletion: Bool)
+}
+
+public struct DiffDisplayRow: Equatable, Identifiable, Sendable {
+  public let id: Int
+  public let kind: DiffRowKind
+  /// 带 diff 前缀（+/-/空格）的原始行文本；hunk 头行为空。
+  public let text: String
+
+  public init(id: Int, kind: DiffRowKind, text: String) {
+    self.id = id
+    self.kind = kind
+    self.text = text
+  }
+}
+
+extension FileDiff {
+  /// 展平所有 hunk 为渲染行序列，供 diff 面板行号显示与评论锚定共用。
+  public func displayRows() -> [DiffDisplayRow] {
+    var rows: [DiffDisplayRow] = []
+    for hunk in hunks {
+      rows.append(DiffDisplayRow(
+        id: rows.count,
+        kind: .hunkHeader("@@ -\(hunk.oldStart),\(hunk.oldCount) +\(hunk.newStart),\(hunk.newCount) @@"),
+        text: ""
+      ))
+      var oldLine = hunk.oldStart
+      var newLine = hunk.newStart
+      for line in hunk.lines {
+        if line.hasPrefix("+") && !line.hasPrefix("+++") {
+          rows.append(DiffDisplayRow(id: rows.count, kind: .line(number: newLine, isDeletion: false), text: line))
+          newLine += 1
+        } else if line.hasPrefix("-") && !line.hasPrefix("---") {
+          rows.append(DiffDisplayRow(id: rows.count, kind: .line(number: oldLine, isDeletion: true), text: line))
+          oldLine += 1
+        } else {
+          rows.append(DiffDisplayRow(id: rows.count, kind: .line(number: newLine, isDeletion: false), text: line))
+          oldLine += 1
+          newLine += 1
+        }
+      }
+    }
+    return rows
+  }
+}
+
 public struct DiffSnapshot: Codable, Equatable, Identifiable, Sendable {
   public let id: UUID
   public let taskID: UUID?
@@ -64,6 +113,27 @@ public struct DiffSnapshot: Codable, Equatable, Identifiable, Sendable {
 }
 
 public enum DiffEngine {
+  /// 解析引擎权限请求 metadata 里的单文件 unified diff（jsdiff
+  /// `createTwoFilesPatch` 输出：以 `Index:` / `---` / `+++` 开头，没有
+  /// `diff --git` 头），补上合成头后复用 git diff 解析器，供权限卡内嵌预览。
+  public static func parseUnifiedDiff(_ diff: String, fallbackPath: String) -> FileDiff? {
+    let path = fallbackPath.isEmpty ? "file" : fallbackPath
+    let token = path.replacingOccurrences(of: " ", with: "_")
+    let text = diff.hasPrefix("diff --git ") ? diff : "diff --git a/\(token) b/\(token)\n" + diff
+    guard let parsed = parse(text).first else { return nil }
+    // createTwoFilesPatch 不带 "new file mode" 标记：空文件起步（首个 hunk 从
+    // 旧侧第 0 行开始）即新建文件。
+    let status: FileChangeStatus = parsed.hunks.first?.oldStart == 0 ? .added : parsed.status
+    return FileDiff(
+      id: path,
+      path: path,
+      status: status,
+      additions: parsed.additions,
+      deletions: parsed.deletions,
+      hunks: parsed.hunks
+    )
+  }
+
   public static func snapshot(baseDirectory: URL, taskID: UUID? = nil, baseCommit: String? = nil) throws -> DiffSnapshot {
     let arguments = ["diff", "--no-ext-diff", "--unified=3"] + (baseCommit.map { [$0] } ?? []) + ["--"]
     let output = try runGit(arguments, in: baseDirectory)

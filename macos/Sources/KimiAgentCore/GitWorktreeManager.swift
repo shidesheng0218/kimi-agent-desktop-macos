@@ -15,6 +15,83 @@ public struct GitWorktree: Codable, Equatable, Sendable {
 }
 
 public enum GitWorktreeManager {
+  /// 会话级 worktree 的固定布局（参照 Claude 的 .claude/worktrees 惯例，
+  /// 用 .kimi 前缀）：<repo>/.kimi/worktrees/<session-id 前 8 位>，
+  /// 分支 kimi/session-<id>。纯函数，便于自检覆盖。
+  public static func sessionWorktreeLocation(repositoryRoot: URL, sessionID: UUID) -> (directory: URL, branch: String) {
+    let shortID = String(sessionID.uuidString.prefix(8)).lowercased()
+    return (
+      repositoryRoot.appendingPathComponent(".kimi/worktrees/\(shortID)", isDirectory: true),
+      "kimi/session-\(shortID)"
+    )
+  }
+
+  /// 为会话创建独立工作区。调用方需先确认 hasUsableHEAD；任何 git 失败
+  /// 都会抛错，由调用方静默回退到项目根。git 子进程在 detached 任务里
+  /// 同步等待（参照 KimiPullRequestMonitor 的 KimiProcessRunner 用法），
+  /// 不阻塞调用方 actor。
+  public static func createSessionWorktree(projectRoot: URL, sessionID: UUID) async throws -> GitWorktree {
+    try await Task.detached(priority: .userInitiated) {
+      let repositoryRoot = URL(
+        fileURLWithPath: try runGit(["rev-parse", "--show-toplevel"], in: projectRoot).trimmingCharacters(in: .whitespacesAndNewlines),
+        isDirectory: true
+      )
+      let baseCommit = try runGit(["rev-parse", "HEAD"], in: repositoryRoot).trimmingCharacters(in: .whitespacesAndNewlines)
+      let location = sessionWorktreeLocation(repositoryRoot: repositoryRoot, sessionID: sessionID)
+      try FileManager.default.createDirectory(
+        at: location.directory.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+      )
+      try runGit(["worktree", "add", "-b", location.branch, location.directory.path, baseCommit], in: repositoryRoot)
+      // worktree 目录位于主仓库工作树内，把它写进 repo 级 info/exclude
+      // （不动用户的 .gitignore），否则项目根的 git status 会多出一条
+      // 未跟踪的 .kimi/ 条目，污染其他会话的 Diff 面板。
+      excludeWorktreesFromStatus(repositoryRoot: repositoryRoot)
+      return GitWorktree(repositoryPath: repositoryRoot.path, path: location.directory, branch: location.branch, baseCommit: baseCommit)
+    }.value
+  }
+
+  /// worktree 是否有未提交改动（含未跟踪文件），删除前提示用。
+  public static func hasUncommittedChanges(_ worktree: GitWorktree) async -> Bool {
+    await Task.detached(priority: .utility) {
+      let status = try? runGit(["status", "--porcelain"], in: worktree.path)
+      return !(status?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }.value
+  }
+
+  /// 删除会话 worktree 及其分支。--force 丢弃未提交改动，是否接受该风险
+  /// 由调用方（删除会话确认框）决定。
+  public static func removeSessionWorktree(_ worktree: GitWorktree) async throws {
+    try await Task.detached(priority: .utility) {
+      let repository = URL(fileURLWithPath: worktree.repositoryPath, isDirectory: true)
+      try runGit(["worktree", "remove", "--force", worktree.path.path], in: repository)
+      try? runGit(["branch", "-D", worktree.branch], in: repository)
+    }.value
+  }
+
+  /// 基于 HEAD 判断是否能为项目创建 worktree：非 git 仓库或尚无提交的
+  /// 空仓库都返回 false（git worktree add 需要 HEAD 作为基准）。
+  public static func canCreateSessionWorktree(_ directory: URL) async -> Bool {
+    await Task.detached(priority: .utility) { hasUsableHEAD(directory) }.value
+  }
+
+  private static func excludeWorktreesFromStatus(repositoryRoot: URL) {
+    guard let rawGitDir = try? runGit(["rev-parse", "--git-common-dir"], in: repositoryRoot)
+      .trimmingCharacters(in: .whitespacesAndNewlines), !rawGitDir.isEmpty else { return }
+    // --git-common-dir 可能返回相对路径（如 .git），按仓库根解析。
+    let gitCommonDir = rawGitDir.hasPrefix("/")
+      ? rawGitDir
+      : repositoryRoot.appendingPathComponent(rawGitDir).standardizedFileURL.path
+    let infoDirectory = URL(fileURLWithPath: gitCommonDir, isDirectory: true).appendingPathComponent("info", isDirectory: true)
+    let excludeFile = infoDirectory.appendingPathComponent("exclude")
+    try? FileManager.default.createDirectory(at: infoDirectory, withIntermediateDirectories: true)
+    let entry = ".kimi/worktrees/"
+    let existing = (try? String(contentsOf: excludeFile, encoding: .utf8)) ?? ""
+    guard !existing.split(separator: "\n").contains(where: { $0.trimmingCharacters(in: .whitespaces) == entry }) else { return }
+    let prefix = existing.isEmpty || existing.hasSuffix("\n") ? existing : existing + "\n"
+    try? (prefix + entry + "\n").write(to: excludeFile, atomically: true, encoding: .utf8)
+  }
+
   public static func isRepository(_ directory: URL) -> Bool {
     (try? runGit(["rev-parse", "--show-toplevel"], in: directory)) != nil
   }

@@ -67,9 +67,15 @@ public enum KimiHeadlessRuntimeFactory {
       resolvedModelID = KimiRuntimeIdentityStore.defaultModelID
     }
     let modelID = resolvedModelID
+    // Optional low-cost route for the engine's lightweight tasks (title
+    // generation etc.): only honored when KIMI_SMALL_MODEL names a different
+    // model, which must also join the provider's models table below or
+    // engine-side validation would reject the reference.
+    let envSmallModelID = environment["KIMI_SMALL_MODEL"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let smallModelID = (!envSmallModelID.isEmpty && envSmallModelID != modelID) ? envSmallModelID : nil
     // Every selectable model must exist in the injected provider table, or
     // per-prompt model references would fail engine-side validation.
-    let tableModelIDs = ([modelID] + modelCatalog).reduce(into: [String]()) { result, item in
+    let tableModelIDs = ([modelID] + (smallModelID.map { [$0] } ?? []) + modelCatalog).reduce(into: [String]()) { result, item in
       let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
       if !trimmed.isEmpty, !result.contains(trimmed) { result.append(trimmed) }
     }
@@ -162,7 +168,7 @@ public enum KimiHeadlessRuntimeFactory {
 
     var config: [String: Any] = [
       "model": "\(KimiRuntimeIdentityStore.providerID)/\(modelID)",
-      "small_model": "\(KimiRuntimeIdentityStore.providerID)/\(modelID)",
+      "small_model": "\(KimiRuntimeIdentityStore.providerID)/\(smallModelID ?? modelID)",
       "plugin": pluginEntry,
       "provider": providerEntries,
       "permission": ["read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "websearch": "allow", "webfetch": "allow", "task": "allow", "bash": "ask", "edit": "ask", "external_directory": "ask", "question": "ask", "skill": "ask"],

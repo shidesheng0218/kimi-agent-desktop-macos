@@ -40,11 +40,29 @@ public struct HarnessRoutePolicy: Sendable {
 
 public struct PromptInput: Codable, Equatable, Sendable {
   public let text: String
-  public let attachments: [String]
+  /// 随 prompt 一起发送的附件（图片 data URL / 项目文件 file:// 引用），
+  /// 映射为引擎 FilePartInput；空数组时与历史行为完全一致。
+  public let attachments: [KimiPromptAttachment]
+  /// prompt 级引擎 agent（如 "plan"）；nil 走引擎默认 build。
+  public let agent: String?
 
-  public init(text: String, attachments: [String] = []) {
+  public init(text: String, attachments: [KimiPromptAttachment] = [], agent: String? = nil) {
     self.text = text.trimmingCharacters(in: .whitespacesAndNewlines)
     self.attachments = attachments
+    self.agent = agent
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case text, attachments, agent
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let text = try container.decode(String.self, forKey: .text)
+    // 旧的 Harness 日志里 attachments 是 [String]；类型不符时按无附件处理，
+    // 而不是让整条历史记录解码失败被跳过。
+    let attachments = (try? container.decode([KimiPromptAttachment].self, forKey: .attachments)) ?? []
+    self.init(text: text, attachments: attachments, agent: try? container.decode(String.self, forKey: .agent))
   }
 }
 
